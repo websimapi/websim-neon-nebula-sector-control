@@ -4,7 +4,6 @@ import { getHexGrid, hexToPixel, getKey, getNeighbors, hexDistance } from './hex
 const MAX_PLAYERS = 4;
 const BOARD_RADIUS = 4;
 const STARTING_ENERGY = 3;
-const WINNING_SCORE = 20; // Or standard turn limit
 const COSTS = {
     DEPLOY: 2,
     FORTIFY: 1,
@@ -19,26 +18,21 @@ const sfx = {
 };
 const playSound = (name) => {
     sfx[name].currentTime = 0;
-    sfx[name].play().catch(e => {}); // Ignore interaction errors
+    sfx[name].play().catch(e => {}); 
 };
 
 // --- DB HELPERS ---
-// Using columns 1 and 2 of a record per user as requested by prompt constraints.
-// We will use a collection named 'user_data_v1' where the owner is the user.
 async function getUserData() {
     try {
         const currentUser = await window.websim.getCurrentUser();
-        // Filter by owner = current user. 
-        // Note: Websim filter usually works on fields, not metadata like 'owner'. 
-        // We will create a record with 'username' field to query.
+        // Use 'user_data_v1' collection
         const records = await room.collection('user_data_v1').filter({ username: currentUser.username }).getList();
         
         if (records.length === 0) {
-            // Initialize new user row
             return await room.collection('user_data_v1').create({
                 username: currentUser.username,
-                col_1: { wins: 0, losses: 0, matches_played: 0, elo: 1000 }, // Stats
-                col_2: { history: [] } // Match Log
+                col_1: { wins: 0, losses: 0, matches_played: 0, elo: 1000 },
+                col_2: { history: [] }
             });
         }
         return records[0];
@@ -69,7 +63,6 @@ async function updateStats(isWinner, matchId) {
         result: isWinner ? 'WIN' : 'LOSS',
         date: new Date().toISOString()
     });
-    // Keep history short
     if (history.length > 10) history.pop();
 
     await room.collection('user_data_v1').update(record.id, {
@@ -82,13 +75,12 @@ async function updateStats(isWinner, matchId) {
 const room = new WebsimSocket();
 
 function Game() {
-    const [status, setStatus] = React.useState('loading'); // loading, lobby, playing, gameover
+    const [status, setStatus] = React.useState('loading');
     const [peers, setPeers] = React.useState({});
     const [roomState, setRoomState] = React.useState({});
     const [presence, setPresence] = React.useState({});
     const [myId, setMyId] = React.useState(null);
-    const [action, setAction] = React.useState(null); // 'deploy', 'fortify', 'overload'
-    const [hoverHex, setHoverHex] = React.useState(null);
+    const [action, setAction] = React.useState(null);
     const [userStats, setUserStats] = React.useState(null);
     const [leaderboard, setLeaderboard] = React.useState([]);
 
@@ -98,13 +90,16 @@ function Game() {
 
         const init = async () => {
             await room.initialize();
+            
             setPeers({ ...room.peers });
             setRoomState(room.roomState);
             setPresence(room.presence);
             setMyId(room.clientId);
             
-            // Replaced missing subscribePeers with subscribePresence hook that updates peers
+            // Subscribe to room state
             cleanupRoom = room.subscribeRoomState(setRoomState);
+            
+            // Subscribe to presence (handles peers joining/leaving)
             cleanupPresence = room.subscribePresence((newPresence) => {
                 setPresence(newPresence);
                 setPeers({ ...room.peers });
@@ -114,22 +109,29 @@ function Game() {
             const stats = await getUserData();
             setUserStats(stats?.col_1);
 
-            // Initial Room State Setup if empty
-            if (!room.roomState.phase) {
-                room.updateRoomState({
-                    phase: 'lobby',
-                    players: [], // { id, color, energy, score }
-                    board: {}, // Keyed by "q,r" -> { owner: null/id, strength: 0 }
-                    turnIndex: 0,
-                    turnStartTime: Date.now()
-                });
-            }
+            // Fetch Leaderboard
+            try {
+                const allStats = await room.collection('user_data_v1').getList();
+                const sorted = allStats.sort((a,b) => (b.col_1?.elo || 0) - (a.col_1?.elo || 0)).slice(0, 10);
+                setLeaderboard(sorted);
+            } catch(e) { console.warn("Leaderboard fetch failed", e); }
 
-            setStatus(room.roomState.phase || 'lobby');
+            // Initial Room State defaults
+            if (!room.roomState.phase) {
+                // Only host initializes if phase is missing
+                if (Object.keys(room.peers)[0] === room.clientId) {
+                    room.updateRoomState({
+                        phase: 'lobby',
+                        players: [],
+                        board: {},
+                        turnIndex: 0,
+                        turnStartTime: Date.now()
+                    });
+                }
+            }
             
-            const allStats = await room.collection('user_data_v1').getList();
-            const sorted = allStats.sort((a,b) => (b.col_1?.elo || 0) - (a.col_1?.elo || 0)).slice(0, 10);
-            setLeaderboard(sorted);
+            if (room.roomState.phase) setStatus(room.roomState.phase);
+            else setStatus('lobby');
         };
         init();
 
@@ -139,55 +141,45 @@ function Game() {
         };
     }, []);
 
-    // Sync local status with room phase
     React.useEffect(() => {
         if (roomState.phase) {
             setStatus(roomState.phase);
         }
     }, [roomState.phase]);
 
-    // --- GAME LOGIC ---
+    // --- GAME ACTIONS ---
 
     const startGame = () => {
         const playerIds = Object.keys(peers);
-        if (playerIds.length < 1) return; // Allow 1 for testing, normally 2+
+        if (playerIds.length < 1) return; 
 
-        // Initialize Board
+        // 1. Setup Grid
         const grid = getHexGrid(BOARD_RADIUS);
         const board = {};
         grid.forEach(hex => {
             board[getKey(hex)] = { ...hex, owner: null, strength: 0 };
         });
 
-        // Initialize Players
+        // 2. Setup Players
         const players = playerIds.map((id, index) => ({
             id: id,
-            colorIndex: index + 1, // 1-4
+            colorIndex: index + 1,
             energy: STARTING_ENERGY,
             score: 0,
             username: peers[id].username
         }));
 
-        // Assign Start Positions (Corners)
-        // Hardcoded start positions for 4-radius hex grid
-        const starts = [
-            {q: 0, r: 0}, // Center (for 1 player test) or
-            {q: 0, r: -4}, {q: 0, r: 4}, // Top/Bottom
-            {q: -4, r: 0}, {q: 4, r: 0}  // Sides
-        ]; 
-        
-        // Better spread for N players
-        const actualStarts = [];
-        if (players.length === 1) actualStarts.push({q:0, r:0});
-        else if (players.length === 2) { actualStarts.push({q:0, r:-4}, {q:0, r:4}); }
+        // 3. Assign Starts
+        const starts = [];
+        if (players.length === 1) starts.push({q:0, r:0});
+        else if (players.length === 2) { starts.push({q:0, r:-4}, {q:0, r:4}); }
         else {
-             // Just pick random edge hexes for 3+
-             actualStarts.push({q:0, r:-4}, {q:4, r:-4}, {q:4, r:0}, {q:0, r:4}, {q:-4, r:4}, {q:-4, r:0});
+             starts.push({q:0, r:-4}, {q:4, r:-4}, {q:4, r:0}, {q:0, r:4}, {q:-4, r:4}, {q:-4, r:0});
         }
 
         players.forEach((p, i) => {
-            if (i < actualStarts.length) {
-                const hexKey = getKey(actualStarts[i]);
+            if (i < starts.length) {
+                const hexKey = getKey(starts[i]);
                 if (board[hexKey]) {
                     board[hexKey].owner = p.id;
                     board[hexKey].strength = 3;
@@ -200,8 +192,7 @@ function Game() {
             board,
             players,
             turnIndex: 0,
-            turnStartTime: Date.now(),
-            logs: []
+            turnStartTime: Date.now()
         });
         
         playSound('deploy');
@@ -214,10 +205,8 @@ function Game() {
         if (myPlayerIndex === -1) return; // Spectator
         if (roomState.turnIndex !== myPlayerIndex) return; // Not my turn
 
-        const me = roomState.players[myPlayerIndex];
         const key = getKey(hex);
         const cell = roomState.board[key];
-        
         if (!cell) return;
 
         let newBoard = { ...roomState.board };
@@ -225,20 +214,13 @@ function Game() {
         let currentPlayer = { ...newPlayers[myPlayerIndex] };
         let actionSuccess = false;
 
-        // --- ACTION LOGIC ---
-        
         if (action === 'deploy') {
-            // Rule: Must be empty, must be adjacent to own tile (or you have 0 tiles)
-            // Cost: 2
             if (currentPlayer.energy >= COSTS.DEPLOY && cell.owner === null) {
-                // Check adjacency
                 const neighbors = getNeighbors(hex);
                 const hasNeighbor = neighbors.some(n => {
                     const nKey = getKey(n);
                     return roomState.board[nKey] && roomState.board[nKey].owner === myId;
                 });
-                
-                // Allow if adjacent OR if player has no tiles left on board (wiped out recovery)
                 const hasAnyTile = Object.values(roomState.board).some(t => t.owner === myId);
 
                 if (hasNeighbor || !hasAnyTile) {
@@ -249,8 +231,6 @@ function Game() {
                 }
             }
         } else if (action === 'fortify') {
-            // Rule: Must own tile. Max strength 5?
-            // Cost: 1
             if (currentPlayer.energy >= COSTS.FORTIFY && cell.owner === myId) {
                 newBoard[key] = { ...cell, strength: cell.strength + 1 };
                 currentPlayer.energy -= COSTS.FORTIFY;
@@ -258,22 +238,16 @@ function Game() {
                 playSound('deploy');
             }
         } else if (action === 'overload') {
-            // Rule: Must be enemy tile. Must be adjacent to own tile. own tile strength > enemy.
-            // Cost: 3
             if (currentPlayer.energy >= COSTS.OVERLOAD && cell.owner !== null && cell.owner !== myId) {
                 const neighbors = getNeighbors(hex);
-                // Find strongest adjacent friendly
                 const myStrongestAdj = neighbors.reduce((maxStr, n) => {
                     const nKey = getKey(n);
                     const nCell = roomState.board[nKey];
-                    if (nCell && nCell.owner === myId) {
-                        return Math.max(maxStr, nCell.strength);
-                    }
+                    if (nCell && nCell.owner === myId) return Math.max(maxStr, nCell.strength);
                     return maxStr;
                 }, 0);
 
                 if (myStrongestAdj > cell.strength) {
-                    // Success!
                     newBoard[key] = { ...cell, owner: myId, strength: Math.max(1, cell.strength - 1) };
                     currentPlayer.energy -= COSTS.OVERLOAD;
                     actionSuccess = true;
@@ -284,18 +258,12 @@ function Game() {
 
         if (actionSuccess) {
             newPlayers[myPlayerIndex] = currentPlayer;
-            
-            // Recalculate Scores
             newPlayers.forEach(p => {
                 p.score = Object.values(newBoard).filter(c => c.owner === p.id).length;
             });
 
-            room.updateRoomState({
-                board: newBoard,
-                players: newPlayers
-            });
+            room.updateRoomState({ board: newBoard, players: newPlayers });
             
-            // Win Condition Check (Total domination)
             const alivePlayers = newPlayers.filter(p => p.score > 0);
             if (alivePlayers.length === 1 && newPlayers.length > 1) {
                 endGame(alivePlayers[0].id);
@@ -310,11 +278,16 @@ function Game() {
         let nextIndex = (roomState.turnIndex + 1) % roomState.players.length;
         let newPlayers = [...roomState.players];
 
-        // Give energy to NEXT player based on their territory
+        // Skip eliminated players
+        let attempts = 0;
+        while (newPlayers[nextIndex].score === 0 && attempts < newPlayers.length) {
+             nextIndex = (nextIndex + 1) % newPlayers.length;
+             attempts++;
+        }
+        
+        // Income for next player
         const nextPlayerId = newPlayers[nextIndex].id;
         const territoryCount = Object.values(roomState.board).filter(c => c.owner === nextPlayerId).length;
-        
-        // Income Logic: Base 2 + 1 per 3 tiles
         const income = 2 + Math.floor(territoryCount / 3);
         newPlayers[nextIndex].energy += income;
 
@@ -329,30 +302,25 @@ function Game() {
         room.updateRoomState({ phase: 'gameover', winner: winnerId });
         playSound('victory');
         
-        // Update Stats
         if (winnerId === myId) {
-            updateStats(true, room.roomState.turnStartTime); // using timestamp as rough ID
+            updateStats(true, room.roomState.turnStartTime);
         } else {
-            // Find if I was a player
             const wasPlayer = roomState.players.find(p => p.id === myId);
             if (wasPlayer) updateStats(false, room.roomState.turnStartTime);
         }
     };
 
-    // --- RENDER HELPERS ---
+    // --- RENDER ---
 
     const isMyTurn = status === 'playing' && roomState.players && roomState.players[roomState.turnIndex]?.id === myId;
     const myPlayer = roomState.players?.find(p => p.id === myId);
 
     const canAfford = (cost) => myPlayer && myPlayer.energy >= cost;
 
-    // Board Rendering
     const hexElements = [];
     if (roomState.board) {
         Object.values(roomState.board).forEach(hex => {
             const px = hexToPixel(hex);
-            const isOwner = hex.owner === myId;
-            const isEnemy = hex.owner && hex.owner !== myId;
             
             let colorClass = 'p0';
             if (hex.owner) {
@@ -360,36 +328,30 @@ function Game() {
                 if (ownerIdx >= 0) colorClass = `p${roomState.players[ownerIdx].colorIndex}`;
             }
 
-            // Highlighting based on action
             let opacity = 1;
             let stroke = null;
-            
             if (isMyTurn && action) {
+                // ... (highlight logic kept simpler for brevity)
                 const neighbors = getNeighbors(hex);
                 const hasFriendlyAdj = neighbors.some(n => {
                    const c = roomState.board[getKey(n)];
                    return c && c.owner === myId;
                 });
-
                 if (action === 'deploy') {
-                    // Highlight empty adjacent
-                    if (hex.owner === null && hasFriendlyAdj) stroke = 'white';
-                    else opacity = 0.3;
+                     if (!(hex.owner === null && (hasFriendlyAdj || !Object.values(roomState.board).some(t => t.owner === myId)))) opacity = 0.3;
+                     else stroke = 'white';
                 } else if (action === 'fortify') {
-                    if (hex.owner === myId) stroke = 'white';
-                    else opacity = 0.3;
+                     if (hex.owner !== myId) opacity = 0.3;
+                     else stroke = 'white';
                 } else if (action === 'overload') {
-                    if (isEnemy && hasFriendlyAdj) stroke = 'red';
-                    else opacity = 0.3;
+                     if (!(hex.owner && hex.owner !== myId && hasFriendlyAdj)) opacity = 0.3;
+                     else stroke = 'red';
                 }
             }
-            
-            // Hover effect from other players?
-            // Could iterate room.presence to show rings around hexes
 
             hexElements.push(
                 <g key={getKey(hex)} 
-                   transform={`translate(${px.x + window.innerWidth/2}, ${px.y + window.innerHeight/2})`}
+                   transform={`translate(${px.x}, ${px.y})`}
                    onClick={() => handleHexClick(hex)}
                    className="hex-group">
                     <polygon 
@@ -405,9 +367,7 @@ function Game() {
         });
     }
 
-    // --- UI STATES ---
-
-    if (status === 'loading') return <div className="screen"><h1>Initializing Nebula...</h1></div>;
+    if (status === 'loading') return <div className="screen"><h1>Initializing...</h1></div>;
 
     if (status === 'lobby') {
         const isHost = Object.keys(peers)[0] === myId;
@@ -428,24 +388,15 @@ function Game() {
                                 </li>
                             ))}
                         </ul>
-                        {Object.keys(peers).length < 2 && <p style={{color:'#666'}}>Waiting for opponent...</p>}
                         {isHost ? (
-                            <button className="btn" disabled={Object.keys(peers).length < 1} onClick={startGame}>
-                                Start Conquest
-                            </button>
-                        ) : (
-                            <p>Waiting for host to start...</p>
-                        )}
+                            <button className="btn" disabled={Object.keys(peers).length < 1} onClick={startGame}>Start Conquest</button>
+                        ) : <p>Waiting for host...</p>}
                     </div>
-
                     <div className="modal">
                         <h2>Leaderboard</h2>
                         <ul className="player-list">
                             {leaderboard.map((record, i) => (
-                                <li key={record.id}>
-                                    <span>#{i+1} {record.username}</span>
-                                    <span style={{color:'var(--accent)'}}>{record.col_1?.elo || 1000} ELO</span>
-                                </li>
+                                <li key={record.id}>#{i+1} {record.username} ({record.col_1?.elo})</li>
                             ))}
                         </ul>
                     </div>
@@ -456,84 +407,57 @@ function Game() {
 
     if (status === 'gameover') {
         const winner = roomState.players.find(p => p.id === roomState.winner);
-        const isMe = roomState.winner === myId;
         return (
             <div className="screen">
                 <div className="modal">
-                    <h1 className="neon-text">{isMe ? "VICTORY" : "DEFEAT"}</h1>
+                    <h1>{roomState.winner === myId ? "VICTORY" : "DEFEAT"}</h1>
                     <p>Winner: {winner?.username}</p>
-                    <div style={{margin: '20px 0'}}>
-                        <p>Your Stats Updated:</p>
-                        <div className="stat-row"><span>Wins:</span> <span>{userStats?.wins}</span></div>
-                        <div className="stat-row"><span>Losses:</span> <span>{userStats?.losses}</span></div>
-                        <div className="stat-row"><span>ELO:</span> <span>{userStats?.elo}</span></div>
-                    </div>
-                    <button className="btn" onClick={() => room.updateRoomState({ phase: 'lobby' })}>Return to Lobby</button>
+                    <button className="btn" onClick={() => room.updateRoomState({ phase: 'lobby' })}>Return</button>
                 </div>
             </div>
         );
     }
 
-    // Playing State
+    // Using a fixed viewBox centered at 0,0 to automatically scale the board
+    // Board radius 4 * 30px ~ 120px + padding => 300px range
     return (
         <div className="screen">
-            {/* HUD Top */}
             <div className="hud-top">
                 <div style={{display:'flex', gap:'10px'}}>
                     {roomState.players.map(p => (
                         <div key={p.id} className={`turn-indicator ${roomState.players[roomState.turnIndex].id === p.id ? 'turn-active' : ''}`}
-                             style={{ color: p.colorIndex === 1 ? '#00f0ff' : p.colorIndex === 2 ? '#ff0055' : p.colorIndex === 3 ? '#ccff00' : '#bd00ff' }}>
-                            {p.username} 
-                            <br/><small>Score: {p.score}</small>
+                             style={{ color: p.score === 0 ? '#555' : (p.colorIndex === 1 ? '#00f0ff' : p.colorIndex === 2 ? '#ff0055' : p.colorIndex === 3 ? '#ccff00' : '#bd00ff') }}>
+                            {p.username} ({p.score})
                         </div>
                     ))}
                 </div>
-                <div>
-                   {myPlayer && <div style={{ fontSize: '1.5rem', color: 'var(--accent)' }}>⚡ {myPlayer.energy} Energy</div>}
-                </div>
+                <div>{myPlayer && <div style={{ fontSize: '1.5rem', color: 'var(--accent)' }}>⚡ {myPlayer.energy}</div>}</div>
             </div>
 
-            {/* Board */}
             <div className="game-board-container">
-                <svg className="hex-grid" viewBox={`0 0 ${window.innerWidth} ${window.innerHeight}`}>
+                <svg className="hex-grid" viewBox="-400 -350 800 700" preserveAspectRatio="xMidYMid meet">
                     {hexElements}
                 </svg>
             </div>
 
-            {/* HUD Bottom (Controls) */}
             {isMyTurn ? (
                 <div className="hud-bottom">
-                    <div className={`action-card ${action === 'deploy' ? 'selected' : ''}`}
-                         style={{ opacity: canAfford(COSTS.DEPLOY) ? 1 : 0.5, pointerEvents: canAfford(COSTS.DEPLOY) ? 'auto' : 'none' }}
-                         onClick={() => setAction(action === 'deploy' ? null : 'deploy')}>
-                        <img src="icon_energy.png" alt="Deploy" />
-                        <span>Deploy</span>
-                        <span className="cost-badge">-{COSTS.DEPLOY} NRG</span>
+                    <div className={`action-card ${action === 'deploy' ? 'selected' : ''}`} onClick={() => setAction(action==='deploy'?null:'deploy')}
+                         style={{opacity:canAfford(COSTS.DEPLOY)?1:0.5}}>
+                        <img src="icon_energy.png"/><span>Deploy ({COSTS.DEPLOY})</span>
                     </div>
-                    <div className={`action-card ${action === 'fortify' ? 'selected' : ''}`}
-                         style={{ opacity: canAfford(COSTS.FORTIFY) ? 1 : 0.5, pointerEvents: canAfford(COSTS.FORTIFY) ? 'auto' : 'none' }}
-                         onClick={() => setAction(action === 'fortify' ? null : 'fortify')}>
-                        <img src="icon_shield.png" alt="Fortify" />
-                        <span>Fortify</span>
-                        <span className="cost-badge">-{COSTS.FORTIFY} NRG</span>
+                    <div className={`action-card ${action === 'fortify' ? 'selected' : ''}`} onClick={() => setAction(action==='fortify'?null:'fortify')}
+                         style={{opacity:canAfford(COSTS.FORTIFY)?1:0.5}}>
+                        <img src="icon_shield.png"/><span>Fortify ({COSTS.FORTIFY})</span>
                     </div>
-                    <div className={`action-card ${action === 'overload' ? 'selected' : ''}`}
-                         style={{ opacity: canAfford(COSTS.OVERLOAD) ? 1 : 0.5, pointerEvents: canAfford(COSTS.OVERLOAD) ? 'auto' : 'none' }}
-                         onClick={() => setAction(action === 'overload' ? null : 'overload')}>
-                        <img src="icon_attack.png" alt="Overload" />
-                        <span>Overload</span>
-                        <span className="cost-badge">-{COSTS.OVERLOAD} NRG</span>
+                    <div className={`action-card ${action === 'overload' ? 'selected' : ''}`} onClick={() => setAction(action==='overload'?null:'overload')}
+                         style={{opacity:canAfford(COSTS.OVERLOAD)?1:0.5}}>
+                        <img src="icon_attack.png"/><span>Overload ({COSTS.OVERLOAD})</span>
                     </div>
-                    <button className="btn btn-secondary" onClick={endTurn} style={{marginLeft:'20px'}}>
-                        End Turn
-                    </button>
+                    <button className="btn btn-secondary" onClick={endTurn} style={{marginLeft:'20px'}}>End Turn</button>
                 </div>
             ) : (
-                <div className="hud-bottom">
-                    <p style={{background:'rgba(0,0,0,0.8)', padding:'10px', borderRadius:'4px'}}>
-                        Waiting for {roomState.players[roomState.turnIndex]?.username}...
-                    </p>
-                </div>
+                <div className="hud-bottom"><p>Waiting for {roomState.players[roomState.turnIndex]?.username}...</p></div>
             )}
         </div>
     );
