@@ -93,16 +93,22 @@ function Game() {
     const [leaderboard, setLeaderboard] = React.useState([]);
 
     React.useEffect(() => {
+        let cleanupRoom;
+        let cleanupPresence;
+
         const init = async () => {
             await room.initialize();
-            setPeers(room.peers);
+            setPeers({ ...room.peers });
             setRoomState(room.roomState);
             setPresence(room.presence);
             setMyId(room.clientId);
             
-            room.subscribePeers(setPeers);
-            room.subscribeRoomState(setRoomState);
-            room.subscribePresence(setPresence);
+            // Replaced missing subscribePeers with subscribePresence hook that updates peers
+            cleanupRoom = room.subscribeRoomState(setRoomState);
+            cleanupPresence = room.subscribePresence((newPresence) => {
+                setPresence(newPresence);
+                setPeers({ ...room.peers });
+            });
 
             // Fetch user stats
             const stats = await getUserData();
@@ -110,7 +116,6 @@ function Game() {
 
             // Initial Room State Setup if empty
             if (!room.roomState.phase) {
-                // Only first connector sets this up mostly, but updateRoomState merges so it's safe
                 room.updateRoomState({
                     phase: 'lobby',
                     players: [], // { id, color, energy, score }
@@ -122,13 +127,16 @@ function Game() {
 
             setStatus(room.roomState.phase || 'lobby');
             
-            // Fetch global leaderboard (all user_data records)
-            // Note: In a real app we'd want server-side aggregation, but here we scan recent active users
             const allStats = await room.collection('user_data_v1').getList();
             const sorted = allStats.sort((a,b) => (b.col_1?.elo || 0) - (a.col_1?.elo || 0)).slice(0, 10);
             setLeaderboard(sorted);
         };
         init();
+
+        return () => {
+            if (cleanupRoom) cleanupRoom();
+            if (cleanupPresence) cleanupPresence();
+        };
     }, []);
 
     // Sync local status with room phase
@@ -336,6 +344,8 @@ function Game() {
     const isMyTurn = status === 'playing' && roomState.players && roomState.players[roomState.turnIndex]?.id === myId;
     const myPlayer = roomState.players?.find(p => p.id === myId);
 
+    const canAfford = (cost) => myPlayer && myPlayer.energy >= cost;
+
     // Board Rendering
     const hexElements = [];
     if (roomState.board) {
@@ -494,19 +504,22 @@ function Game() {
             {isMyTurn ? (
                 <div className="hud-bottom">
                     <div className={`action-card ${action === 'deploy' ? 'selected' : ''}`}
-                         onClick={() => setAction('deploy')}>
+                         style={{ opacity: canAfford(COSTS.DEPLOY) ? 1 : 0.5, pointerEvents: canAfford(COSTS.DEPLOY) ? 'auto' : 'none' }}
+                         onClick={() => setAction(action === 'deploy' ? null : 'deploy')}>
                         <img src="icon_energy.png" alt="Deploy" />
                         <span>Deploy</span>
                         <span className="cost-badge">-{COSTS.DEPLOY} NRG</span>
                     </div>
                     <div className={`action-card ${action === 'fortify' ? 'selected' : ''}`}
-                         onClick={() => setAction('fortify')}>
+                         style={{ opacity: canAfford(COSTS.FORTIFY) ? 1 : 0.5, pointerEvents: canAfford(COSTS.FORTIFY) ? 'auto' : 'none' }}
+                         onClick={() => setAction(action === 'fortify' ? null : 'fortify')}>
                         <img src="icon_shield.png" alt="Fortify" />
                         <span>Fortify</span>
                         <span className="cost-badge">-{COSTS.FORTIFY} NRG</span>
                     </div>
                     <div className={`action-card ${action === 'overload' ? 'selected' : ''}`}
-                         onClick={() => setAction('overload')}>
+                         style={{ opacity: canAfford(COSTS.OVERLOAD) ? 1 : 0.5, pointerEvents: canAfford(COSTS.OVERLOAD) ? 'auto' : 'none' }}
+                         onClick={() => setAction(action === 'overload' ? null : 'overload')}>
                         <img src="icon_attack.png" alt="Overload" />
                         <span>Overload</span>
                         <span className="cost-badge">-{COSTS.OVERLOAD} NRG</span>
