@@ -170,6 +170,8 @@ function Game() {
         if (humanIds.length < 1) return; 
 
         // 1. Setup Players (Add AI if solo)
+        const PERSONALITY_TYPES = ['AGGRESSIVE', 'DEFENSIVE', 'EXPANSIVE', 'BALANCED'];
+        
         let players = humanIds.map((id, index) => ({
             id: id,
             isAI: false,
@@ -179,18 +181,22 @@ function Game() {
             username: peers[id].username
         }));
 
-        if (players.length === 1) {
-            // Add 3 AI bots for a 4-player game
-            const aiNames = ['Alpha', 'Beta', 'Gamma', 'Delta'];
-            for (let i = 0; i < 3; i++) {
+        // Fill with AI until 4 players
+        if (players.length < MAX_PLAYERS) {
+            const aiNames = ['Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon', 'Zeta'];
+            let aiCount = 0;
+            while (players.length < MAX_PLAYERS) {
+                const pType = PERSONALITY_TYPES[Math.floor(Math.random() * PERSONALITY_TYPES.length)];
                 players.push({
-                    id: `ai-${i}`,
+                    id: `ai-${aiCount}`,
                     isAI: true,
+                    personality: pType, 
                     colorIndex: players.length + 1,
                     energy: STARTING_ENERGY,
                     score: 0,
-                    username: `Bot ${aiNames[i]}`
+                    username: `Bot ${aiNames[aiCount]} [${pType.substring(0,3)}]`
                 });
+                aiCount++;
             }
         }
 
@@ -253,19 +259,29 @@ function Game() {
     const delay = ms => new Promise(res => setTimeout(res, ms));
 
     const executeAITurnSequence = async (originalAiPlayer) => {
+        // AI Personality Weights
+        const weights = {
+            BALANCED: { deploy: 1.0, overload: 1.0, fortify: 1.0 },
+            AGGRESSIVE: { deploy: 0.8, overload: 1.4, fortify: 0.6 },
+            DEFENSIVE: { deploy: 0.8, overload: 0.6, fortify: 1.4 },
+            EXPANSIVE: { deploy: 1.4, overload: 0.8, fortify: 0.8 }
+        };
+
+        const personality = originalAiPlayer.personality || 'BALANCED';
+        const w = weights[personality];
+
         // Small delay before starting turn
         await delay(1000);
 
         let moves = 0;
         let canMove = true;
-        const MAX_MOVES = 5;
+        const MAX_MOVES = 6;
 
         // We fetch fresh state at start of each action
         while (canMove && moves < MAX_MOVES) {
             const freshState = room.roomState; // Get latest
             if (freshState.phase !== 'playing') break;
             
-            // Re-find player in fresh state
             let players = [...freshState.players];
             let board = { ...freshState.board };
             let turnIndex = freshState.turnIndex;
@@ -280,15 +296,14 @@ function Game() {
             let bestScore = -Infinity;
 
             const myTiles = Object.values(board).filter(t => t.owner === aiPlayer.id);
-            const myTileKeys = myTiles.map(getKey);
             const hasTiles = myTiles.length > 0;
 
             // 1. Evaluate DEPLOY moves
             if (aiPlayer.energy >= COSTS.DEPLOY) {
-                // Find all empty spots adjacent to me (or anywhere if I have no tiles)
                 let candidates = [];
                 if (!hasTiles) {
-                    candidates = Object.values(board).filter(t => t.owner === null);
+                    // Respawn logic: Find empty spot far from enemies? Or just random.
+                    candidates = Object.values(board).filter(t => !t.owner);
                 } else {
                     const potentialKeys = new Set();
                     myTiles.forEach(t => {
@@ -296,19 +311,27 @@ function Game() {
                     });
                     candidates = Array.from(potentialKeys)
                         .map(k => board[k])
-                        .filter(t => t && t.owner === null);
+                        .filter(t => t && (!t.owner || !players.some(p => p.id === t.owner))); // Treat zombie as empty
                 }
 
                 candidates.forEach(target => {
-                    // Heuristic: Expand towards center or towards enemies?
-                    // Simple: Score based on number of empty neighbors (more expansion)
                     const neighbors = getNeighbors(target);
+                    // Heuristic: Prefer spots with more empty neighbors (expansion potential)
                     const emptyNeighbors = neighbors.filter(n => {
                         const cell = board[getKey(n)];
-                        return cell && cell.owner === null;
+                        return cell && !cell.owner;
                     }).length;
                     
-                    const score = 10 + emptyNeighbors; // Base priority for expansion
+                    // Prefer spots connecting to my own territory strongly?
+                    const myNeighbors = neighbors.filter(n => {
+                        const cell = board[getKey(n)];
+                        return cell && cell.owner === aiPlayer.id;
+                    }).length;
+
+                    // Base 10 + bonus
+                    let rawScore = 10 + (emptyNeighbors * 2) + myNeighbors;
+                    let score = rawScore * w.deploy;
+
                     if (score > bestScore) {
                         bestScore = score;
                         bestMove = { type: 'DEPLOY', target: target };
@@ -323,27 +346,35 @@ function Game() {
                     getNeighbors(tile).forEach(n => {
                         const nKey = getKey(n);
                         const target = board[nKey];
+                        // Target must be enemy
                         if (target && target.owner && target.owner !== aiPlayer.id) {
-                            targets.push({ tile: target, from: tile });
+                            targets.push(target);
                         }
                     });
                 });
 
-                targets.forEach(({ tile, from }) => {
-                    const targetNeighbors = getNeighbors(tile);
-                    // My max strength adjacent to target
+                // Unique targets
+                const uniqueTargets = [...new Set(targets)];
+
+                uniqueTargets.forEach(target => {
+                    const targetNeighbors = getNeighbors(target);
                     const mySupport = targetNeighbors.reduce((max, n) => {
                         const cell = board[getKey(n)];
                         return (cell && cell.owner === aiPlayer.id) ? Math.max(max, cell.strength) : max;
                     }, 0);
 
-                    if (mySupport > tile.strength) {
-                        // Kill probability 100%
-                        // High score if it breaks a player or is a cheap kill
-                        let score = 30 + (tile.strength * 2); 
+                    if (mySupport > target.strength) {
+                        // We can kill it.
+                        // Score based on value of target (strength) and if it breaks an enemy bonus?
+                        // Simple: Higher strength target = better kill
+                        let rawScore = 25 + (target.strength * 4); 
+                        
+                        // Personality adjustment: Overloading is expensive, make sure it's worth it
+                        let score = rawScore * w.overload;
+
                         if (score > bestScore) {
                             bestScore = score;
-                            bestMove = { type: 'OVERLOAD', target: tile };
+                            bestMove = { type: 'OVERLOAD', target: target };
                         }
                     }
                 });
@@ -352,7 +383,7 @@ function Game() {
             // 3. Evaluate FORTIFY moves (Defend)
             if (aiPlayer.energy >= COSTS.FORTIFY) {
                 myTiles.forEach(tile => {
-                    if (tile.strength >= 3) return; // Max str
+                    if (tile.strength >= 5) return; // Soft cap for AI
 
                     // Check if threatened
                     const neighbors = getNeighbors(tile);
@@ -361,12 +392,16 @@ function Game() {
                         return c && c.owner && c.owner !== aiPlayer.id;
                     });
                     
-                    let score = 0;
+                    let rawScore = 0;
                     if (enemies.length > 0) {
-                        score = 20 + enemies.length * 5; // Defend frontlines
+                        // High priority if threatened, especially if strength is low
+                        rawScore = 15 + (enemies.length * 5) + (5 - tile.strength);
                     } else {
-                        score = 5; // Low priority to bolster safe tiles
+                        // Low priority to just buff safe tiles
+                        rawScore = 2; 
                     }
+
+                    let score = rawScore * w.fortify;
 
                     if (score > bestScore) {
                         bestScore = score;
@@ -417,7 +452,10 @@ function Game() {
                 }
 
                 moves++;
-                await delay(800); // Visual delay between moves
+                // Check if we can afford anything else
+                if (aiPlayer.energy < 1) canMove = false;
+                
+                await delay(600); 
             } else {
                 canMove = false; // No valid moves found
             }
@@ -481,7 +519,11 @@ function Game() {
                 showToast(`Need ${COSTS.DEPLOY} energy to Deploy`);
                 return;
             }
-            if (cell.owner !== null) {
+            // Fix: Relaxed check to handle potential state quirks (undefined/null)
+            // Also check if owner is a valid player to prevent zombie tiles blocking
+            const isOccupied = cell.owner && roomState.players.some(p => p.id === cell.owner);
+            
+            if (isOccupied) {
                 showToast("Target must be empty!");
                 return;
             }
@@ -646,7 +688,9 @@ function Game() {
                 // --- Validation Logic ---
                 // Must match handleHexClick logic exactly for visual consistency
                 if (action === 'deploy') {
-                     isValidTarget = hex.owner === null && (hasFriendlyAdj || !hasAnyTile);
+                     // Check if owner is present AND valid. If owner is not in player list, it's valid to deploy over (zombie).
+                     const isOccupied = hex.owner && roomState.players.some(p => p.id === hex.owner);
+                     isValidTarget = !isOccupied && (hasFriendlyAdj || !hasAnyTile);
                 } else if (action === 'fortify') {
                      isValidTarget = hex.owner === myId;
                 } else if (action === 'overload') {
@@ -665,6 +709,7 @@ function Game() {
                     classNames += " valid-target";
                     cursor = 'pointer';
                 } else {
+                    classNames += " invalid-target";
                     opacity = 0.3; // Dim invalid targets
                 }
             } else if (isMyTurn && !action && hex.owner === myId) {

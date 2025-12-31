@@ -188,12 +188,20 @@ svg.hex-grid {
     stroke: #00f0ff;
     stroke-width: 3px;
     animation: pulse-hex 1.5s infinite;
+    cursor: pointer;
 }
 
 .hex.valid-target:hover {
     stroke: #fff;
     stroke-width: 5px;
     fill-opacity: 0.8;
+    fill: rgba(0, 240, 255, 0.2); /* clear visual cue */
+}
+
+/* Invalid targets when action is selected */
+.hex.invalid-target {
+    cursor: not-allowed;
+    opacity: 0.2;
 }
 
 @keyframes pulse-hex {
