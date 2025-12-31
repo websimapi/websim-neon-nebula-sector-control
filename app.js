@@ -365,29 +365,38 @@ function Game() {
         if (status !== 'playing') return;
         
         const myPlayerIndex = roomState.players.findIndex(p => p.id === myId);
-        if (myPlayerIndex === -1) return; // Spectator
-        if (roomState.turnIndex !== myPlayerIndex) return; // Not my turn
+        if (myPlayerIndex === -1) return; 
+        if (roomState.turnIndex !== myPlayerIndex) return; 
 
         const key = getKey(hex);
+        // Ensure we fetch the latest cell data
         const cell = roomState.board[key];
         if (!cell) return;
 
-        let newBoard = { ...roomState.board };
-        let newPlayers = [...roomState.players];
-        let currentPlayer = { ...newPlayers[myPlayerIndex] };
+        // Use deep clones to prevent reference issues
+        let newBoard = JSON.parse(JSON.stringify(roomState.board));
+        let newPlayers = JSON.parse(JSON.stringify(roomState.players));
+        let currentPlayer = newPlayers[myPlayerIndex];
         let actionSuccess = false;
 
         if (action === 'deploy') {
-            if (currentPlayer.energy >= COSTS.DEPLOY && cell.owner === null) {
+            const hasEnergy = currentPlayer.energy >= COSTS.DEPLOY;
+            const isEmpty = cell.owner === null;
+            
+            if (hasEnergy && isEmpty) {
                 const neighbors = getNeighbors(hex);
+                // Check if any neighbor is owned by me
                 const hasNeighbor = neighbors.some(n => {
                     const nKey = getKey(n);
-                    return roomState.board[nKey] && roomState.board[nKey].owner === myId;
+                    const nCell = roomState.board[nKey];
+                    return nCell && nCell.owner === myId;
                 });
+                // Check if I own ANY tile on the board (if not, I can deploy anywhere)
                 const hasAnyTile = Object.values(roomState.board).some(t => t.owner === myId);
 
                 if (hasNeighbor || !hasAnyTile) {
-                    newBoard[key] = { ...cell, owner: myId, strength: 1 };
+                    newBoard[key].owner = myId;
+                    newBoard[key].strength = 1;
                     currentPlayer.energy -= COSTS.DEPLOY;
                     actionSuccess = true;
                     playSound('deploy');
@@ -395,7 +404,7 @@ function Game() {
             }
         } else if (action === 'fortify') {
             if (currentPlayer.energy >= COSTS.FORTIFY && cell.owner === myId) {
-                newBoard[key] = { ...cell, strength: cell.strength + 1 };
+                newBoard[key].strength += 1;
                 currentPlayer.energy -= COSTS.FORTIFY;
                 actionSuccess = true;
                 playSound('deploy');
@@ -411,7 +420,8 @@ function Game() {
                 }, 0);
 
                 if (myStrongestAdj > cell.strength) {
-                    newBoard[key] = { ...cell, owner: myId, strength: Math.max(1, cell.strength - 1) };
+                    newBoard[key].owner = myId;
+                    newBoard[key].strength = Math.max(1, cell.strength - 1);
                     currentPlayer.energy -= COSTS.OVERLOAD;
                     actionSuccess = true;
                     playSound('overload');
@@ -420,7 +430,6 @@ function Game() {
         }
 
         if (actionSuccess) {
-            newPlayers[myPlayerIndex] = currentPlayer;
             newPlayers.forEach(p => {
                 p.score = Object.values(newBoard).filter(c => c.owner === p.id).length;
             });
@@ -493,34 +502,48 @@ function Game() {
 
             let opacity = 1;
             let stroke = null;
+            let strokeWidth = null;
+            let cursor = 'default';
+
             if (isMyTurn && action) {
-                // ... (highlight logic kept simpler for brevity)
                 const neighbors = getNeighbors(hex);
                 const hasFriendlyAdj = neighbors.some(n => {
                    const c = roomState.board[getKey(n)];
                    return c && c.owner === myId;
                 });
+                const hasAnyTile = Object.values(roomState.board).some(t => t.owner === myId);
+                
+                let isValidTarget = false;
                 if (action === 'deploy') {
-                     if (!(hex.owner === null && (hasFriendlyAdj || !Object.values(roomState.board).some(t => t.owner === myId)))) opacity = 0.3;
-                     else stroke = 'white';
+                     isValidTarget = hex.owner === null && (hasFriendlyAdj || !hasAnyTile);
                 } else if (action === 'fortify') {
-                     if (hex.owner !== myId) opacity = 0.3;
-                     else stroke = 'white';
+                     isValidTarget = hex.owner === myId;
                 } else if (action === 'overload') {
-                     if (!(hex.owner && hex.owner !== myId && hasFriendlyAdj)) opacity = 0.3;
-                     else stroke = 'red';
+                     isValidTarget = hex.owner && hex.owner !== myId && hasFriendlyAdj;
                 }
+
+                if (isValidTarget) {
+                    stroke = '#fff';
+                    strokeWidth = 3;
+                    cursor = 'pointer';
+                } else {
+                    opacity = 0.2;
+                }
+            } else if (isMyTurn && !action && hex.owner === myId) {
+                 // Hint that you can select this tile (maybe for info in future)
+                 cursor = 'help';
             }
 
             hexElements.push(
                 <g key={getKey(hex)} 
                    transform={`translate(${px.x}, ${px.y})`}
                    onClick={() => handleHexClick(hex)}
-                   className="hex-group">
+                   className="hex-group"
+                   style={{ cursor }}>
                     <polygon 
                         points="0,-30 26,-15 26,15 0,30 -26,15 -26,-15" 
                         className={`hex ${colorClass}`}
-                        style={{ opacity, stroke: stroke || undefined }}
+                        style={{ opacity, stroke: stroke || undefined, strokeWidth: strokeWidth || undefined }}
                     />
                     {hex.strength > 0 && (
                         <text x="0" y="5" textAnchor="middle" className="hex-label">{hex.strength}</text>
