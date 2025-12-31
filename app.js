@@ -2,8 +2,9 @@ import { getHexGrid, hexToPixel, getKey, getNeighbors, hexDistance } from './hex
 
 // --- CONFIG ---
 const MAX_PLAYERS = 4;
-const BOARD_RADIUS = 4;
+const BOARD_RADIUS = 6;
 const STARTING_ENERGY = 3;
+const WIN_PCT = 0.8;
 const COSTS = {
     DEPLOY: 2,
     FORTIFY: 1,
@@ -200,19 +201,33 @@ function Game() {
             }
         }
 
-        // 2. Setup Grid
+        // 2. Setup Grid with Terrain
         const grid = getHexGrid(BOARD_RADIUS);
         const board = {};
         grid.forEach(hex => {
-            board[getKey(hex)] = { ...hex, owner: null, strength: 0 };
+            const dist = hexDistance(hex, {q:0, r:0});
+            // 8% Void holes (exclude center area)
+            if (dist > 2 && Math.random() < 0.08) return;
+
+            let type = 'NORMAL';
+            let item = null;
+            
+            // 15% Mountains (Defensive Bonus, Higher Cost)
+            if (Math.random() < 0.15) type = 'MOUNTAIN';
+
+            // 5% Powerups on normal tiles
+            if (type === 'NORMAL' && Math.random() < 0.05) item = 'energy';
+
+            board[getKey(hex)] = { ...hex, owner: null, strength: 0, type, item };
         });
 
         // 3. Assign Starts
         const starts = [];
+        // Adjusted for radius 6
         if (players.length === 1) starts.push({q:0, r:0});
-        else if (players.length === 2) { starts.push({q:0, r:-4}, {q:0, r:4}); }
+        else if (players.length === 2) { starts.push({q:0, r:-5}, {q:0, r:5}); }
         else {
-             starts.push({q:0, r:-4}, {q:4, r:-4}, {q:4, r:0}, {q:0, r:4}, {q:-4, r:4}, {q:-4, r:0});
+             starts.push({q:0, r:-5}, {q:5, r:-5}, {q:5, r:0}, {q:0, r:5}, {q:-5, r:5}, {q:-5, r:0});
         }
 
         players.forEach((p, i) => {
@@ -332,6 +347,13 @@ function Game() {
 
                     // Base 10 + bonus
                     let rawScore = 10 + (emptyNeighbors * 2) + myNeighbors;
+                    
+                    // Prioritize Items
+                    if (target.item === 'energy') rawScore += 25;
+                    
+                    // Mountains cost more but are defensive
+                    if (target.type === 'MOUNTAIN') rawScore -= 5;
+
                     let score = rawScore * w.deploy;
 
                     if (score > bestScore) {
@@ -412,24 +434,46 @@ function Game() {
             if (bestMove) {
                 const k = getKey(bestMove.target);
                 
+                // Powerup Collection Logic
+                if (board[k].item === 'energy') {
+                    aiPlayer.energy += 5;
+                    board[k].item = null;
+                }
+
+                // Terrain Cost Logic
+                let moveCost = 0;
+                if (bestMove.type === 'DEPLOY') moveCost = COSTS.DEPLOY;
+                else if (bestMove.type === 'OVERLOAD') moveCost = COSTS.OVERLOAD;
+                else if (bestMove.type === 'FORTIFY') moveCost = COSTS.FORTIFY;
+
+                if (board[k].type === 'MOUNTAIN' && bestMove.type !== 'FORTIFY') {
+                    moveCost += 1;
+                }
+
                 if (bestMove.type === 'DEPLOY') {
                     board[k] = { ...board[k], owner: aiPlayer.id, strength: 1 };
-                    aiPlayer.energy -= COSTS.DEPLOY;
+                    aiPlayer.energy -= moveCost;
                     playSound('deploy');
                 } else if (bestMove.type === 'OVERLOAD') {
                     board[k] = { ...board[k], owner: aiPlayer.id, strength: Math.max(1, board[k].strength - 1) };
-                    aiPlayer.energy -= COSTS.OVERLOAD;
+                    aiPlayer.energy -= moveCost;
                     playSound('overload');
                 } else if (bestMove.type === 'FORTIFY') {
                     board[k].strength += 1;
-                    aiPlayer.energy -= COSTS.FORTIFY;
+                    aiPlayer.energy -= moveCost;
                     playSound('deploy');
                 }
 
-                // Update Scores
+                // Update Scores & Check Domination
                 players[turnIndex] = aiPlayer;
+                const totalHexes = Object.keys(board).length;
                 players.forEach(p => {
-                    p.score = Object.values(board).filter(c => c.owner === p.id).length;
+                    const owned = Object.values(board).filter(c => c.owner === p.id).length;
+                    p.score = owned;
+                    if (owned / totalHexes >= WIN_PCT) {
+                        // Trigger instant win
+                        players = players.map(pl => ({...pl, score: pl.id === p.id ? 999 : 0})); // Force end
+                    }
                 });
 
                 // Update Room State
@@ -520,15 +564,21 @@ function Game() {
         let currentPlayer = newPlayers[myPlayerIndex];
         let actionSuccess = false;
 
+        // Terrain & Cost Logic
+        let cost = 0;
+        if (action === 'deploy') cost = COSTS.DEPLOY;
+        else if (action === 'fortify') cost = COSTS.FORTIFY;
+        else if (action === 'overload') cost = COSTS.OVERLOAD;
+
+        if (cell.type === 'MOUNTAIN' && action !== 'fortify') cost += 1;
+
+        if (currentPlayer.energy < cost) {
+            showToast(`Need ${cost} energy (Terrain Penalty: ${cell.type==='MOUNTAIN' && action!=='fortify' ? '+1' : '0'})`);
+            return;
+        }
+
         if (action === 'deploy') {
-            if (currentPlayer.energy < COSTS.DEPLOY) {
-                showToast(`Need ${COSTS.DEPLOY} energy to Deploy`);
-                return;
-            }
-            // Fix: Relaxed check to handle potential state quirks (undefined/null)
-            // Also check if owner is a valid player to prevent zombie tiles blocking
             const isOccupied = cell.owner && roomState.players.some(p => p.id === cell.owner);
-            
             if (isOccupied) {
                 showToast("Target must be empty!");
                 return;
@@ -548,34 +598,27 @@ function Game() {
 
             newBoard[key].owner = myId;
             newBoard[key].strength = 1;
-            currentPlayer.energy -= COSTS.DEPLOY;
+            currentPlayer.energy -= cost;
             actionSuccess = true;
             playSound('deploy');
 
         } else if (action === 'fortify') {
-            if (currentPlayer.energy < COSTS.FORTIFY) {
-                showToast(`Need ${COSTS.FORTIFY} energy to Fortify`);
-                return;
-            }
             if (cell.owner !== myId) {
                 showToast("Can only fortify your own tiles");
                 return;
             }
-            if (cell.strength >= 10) { // Arbitrary cap
-                 showToast("Maximum strength reached");
+            const cap = cell.type === 'MOUNTAIN' ? 15 : 10;
+            if (cell.strength >= cap) {
+                 showToast(`Maximum strength reached (${cap})`);
                  return;
             }
 
             newBoard[key].strength += 1;
-            currentPlayer.energy -= COSTS.FORTIFY;
+            currentPlayer.energy -= cost;
             actionSuccess = true;
             playSound('deploy');
 
         } else if (action === 'overload') {
-            if (currentPlayer.energy < COSTS.OVERLOAD) {
-                showToast(`Need ${COSTS.OVERLOAD} energy to Overload`);
-                return;
-            }
             if (cell.owner === null || cell.owner === myId) {
                 showToast("Must target an enemy tile");
                 return;
@@ -599,18 +642,40 @@ function Game() {
 
             newBoard[key].owner = myId;
             newBoard[key].strength = Math.max(1, cell.strength - 1);
-            currentPlayer.energy -= COSTS.OVERLOAD;
+            currentPlayer.energy -= cost;
             actionSuccess = true;
             playSound('overload');
         }
 
         if (actionSuccess) {
+            // Collect Item
+            if (newBoard[key].item === 'energy' && action !== 'overload') { // Cannot collect if overloading enemy? Actually if you capture it you should.
+               // If overload success (tile flips), or deploy success
+               // Actually overload flips it immediately in this logic, so yes.
+               currentPlayer.energy += 5;
+               newBoard[key].item = null;
+               showToast("Energy Cache Collected! +5⚡");
+            }
+            // Note: If overloading and not capturing (just reducing strength), item remains?
+            // Current overload logic: newBoard[key].owner = myId immediately if successful.
+            
+            const totalHexes = Object.keys(newBoard).length;
+
             newPlayers.forEach(p => {
-                p.score = Object.values(newBoard).filter(c => c.owner === p.id).length;
+                const owned = Object.values(newBoard).filter(c => c.owner === p.id).length;
+                p.score = owned;
             });
+
+            const myOwned = newPlayers[myPlayerIndex].score;
+            const domination = myOwned / totalHexes;
 
             room.updateRoomState({ board: newBoard, players: newPlayers });
             
+            if (domination >= WIN_PCT) {
+                endGame(myId);
+                return;
+            }
+
             const alivePlayers = newPlayers.filter(p => p.score > 0);
             if (alivePlayers.length === 1 && newPlayers.length > 1) {
                 endGame(alivePlayers[0].id);
@@ -690,6 +755,10 @@ function Game() {
             let isValidTarget = false;
             let classNames = `hex ${colorClass}`;
 
+            if (hex.type === 'MOUNTAIN') {
+                classNames += " mountain";
+            }
+
             if (isMyTurn && action) {
                 const neighbors = getNeighbors(hex);
                 const hasFriendlyAdj = neighbors.some(n => {
@@ -699,15 +768,12 @@ function Game() {
                 const hasAnyTile = Object.values(roomState.board).some(t => t.owner === myId);
                 
                 // --- Validation Logic ---
-                // Must match handleHexClick logic exactly for visual consistency
                 if (action === 'deploy') {
-                     // Check if owner is present AND valid. If owner is not in player list, it's valid to deploy over (zombie).
                      const isOccupied = hex.owner && roomState.players.some(p => p.id === hex.owner);
                      isValidTarget = !isOccupied && (hasFriendlyAdj || !hasAnyTile);
                 } else if (action === 'fortify') {
                      isValidTarget = hex.owner === myId;
                 } else if (action === 'overload') {
-                    // Pre-calculate strength to see if target is valid
                      if (hex.owner && hex.owner !== myId) {
                          const myStrongestAdj = neighbors.reduce((maxStr, n) => {
                             const nCell = roomState.board[getKey(n)];
@@ -723,24 +789,37 @@ function Game() {
                     cursor = 'pointer';
                 } else {
                     classNames += " invalid-target";
-                    opacity = 0.3; // Dim invalid targets
+                    opacity = 0.3;
                 }
             } else if (isMyTurn && !action && hex.owner === myId) {
                  // Hint that you can select this tile (maybe for info in future)
                  cursor = 'help';
             }
 
+            // Height Effect (Shift Y)
+            const yOffset = hex.type === 'MOUNTAIN' ? -6 : 0;
+            const finalY = px.y + yOffset;
+
+            // Height Shadow
+            const shadow = hex.type === 'MOUNTAIN' ? (
+                <polygon points="0,-24 26,-9 26,21 0,36 -26,21 -26,-9" fill="rgba(0,0,0,0.5)" transform="translate(0, 6)"/>
+            ) : null;
+
             hexElements.push(
                 <g key={getKey(hex)} 
-                   transform={`translate(${px.x}, ${px.y})`}
+                   transform={`translate(${px.x}, ${finalY})`}
                    onClick={() => handleHexClick(hex)}
                    className="hex-group"
                    style={{ cursor }}>
+                    {shadow}
                     <polygon 
                         points="0,-30 26,-15 26,15 0,30 -26,15 -26,-15" 
                         className={classNames}
                         style={{ opacity, stroke: stroke || undefined, strokeWidth: strokeWidth || undefined }}
                     />
+                    {hex.item === 'energy' && !hex.owner && (
+                         <image href="icon_energy.png" x="-10" y="-10" width="20" height="20" className="item-icon" />
+                    )}
                     {hex.strength > 0 && (
                         <text x="0" y="5" textAnchor="middle" className="hex-label">{hex.strength}</text>
                     )}
@@ -820,7 +899,7 @@ function Game() {
             </div>
 
             <div className="game-board-container">
-                <svg className="hex-grid" viewBox="-400 -350 800 700" preserveAspectRatio="xMidYMid meet">
+                <svg className="hex-grid" viewBox="-500 -450 1000 900" preserveAspectRatio="xMidYMid meet">
                     {hexElements}
                 </svg>
             </div>

@@ -170,6 +170,7 @@ svg.hex-grid {
     max-width: 95vw;
     max-height: 80vh;
     filter: drop-shadow(0 0 20px rgba(0,0,0,0.5));
+    overflow: visible;
 }
 
 .hex {
@@ -177,6 +178,24 @@ svg.hex-grid {
     stroke-width: 2px;
     transition: all 0.3s ease;
     cursor: pointer;
+}
+
+.hex.mountain {
+    fill-opacity: 0.6;
+    stroke: #888;
+    stroke-dasharray: 4 2;
+}
+
+.item-icon {
+    pointer-events: none;
+    opacity: 0.9;
+    animation: float 3s ease-in-out infinite;
+    filter: drop-shadow(0 0 5px var(--accent));
+}
+
+@keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-3px); }
 }
 
 .hex:hover {
