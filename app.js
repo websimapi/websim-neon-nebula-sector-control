@@ -230,6 +230,7 @@ function Game() {
             board,
             players,
             turnIndex: 0,
+            totalTurns: 0,
             gameLog: ['Game Started!'],
             turnStartTime: Date.now()
         });
@@ -275,7 +276,8 @@ function Game() {
 
         let moves = 0;
         let canMove = true;
-        const MAX_MOVES = 6;
+        // Dynamic max moves to ensure AI spends energy if possible
+        const MAX_MOVES = Math.max(8, originalAiPlayer.energy);
 
         // We fetch fresh state at start of each action
         while (canMove && moves < MAX_MOVES) {
@@ -302,7 +304,7 @@ function Game() {
             if (aiPlayer.energy >= COSTS.DEPLOY) {
                 let candidates = [];
                 if (!hasTiles) {
-                    // Respawn logic: Find empty spot far from enemies? Or just random.
+                    // Respawn logic
                     candidates = Object.values(board).filter(t => !t.owner);
                 } else {
                     const potentialKeys = new Set();
@@ -365,11 +367,7 @@ function Game() {
 
                     if (mySupport > target.strength) {
                         // We can kill it.
-                        // Score based on value of target (strength) and if it breaks an enemy bonus?
-                        // Simple: Higher strength target = better kill
                         let rawScore = 25 + (target.strength * 4); 
-                        
-                        // Personality adjustment: Overloading is expensive, make sure it's worth it
                         let score = rawScore * w.overload;
 
                         if (score > bestScore) {
@@ -383,7 +381,7 @@ function Game() {
             // 3. Evaluate FORTIFY moves (Defend)
             if (aiPlayer.energy >= COSTS.FORTIFY) {
                 myTiles.forEach(tile => {
-                    if (tile.strength >= 5) return; // Soft cap for AI
+                    if (tile.strength >= 10) return; // Cap for AI
 
                     // Check if threatened
                     const neighbors = getNeighbors(tile);
@@ -394,7 +392,7 @@ function Game() {
                     
                     let rawScore = 0;
                     if (enemies.length > 0) {
-                        // High priority if threatened, especially if strength is low
+                        // High priority if threatened
                         rawScore = 15 + (enemies.length * 5) + (5 - tile.strength);
                     } else {
                         // Low priority to just buff safe tiles
@@ -455,14 +453,13 @@ function Game() {
                 // Check if we can afford anything else
                 if (aiPlayer.energy < 1) canMove = false;
                 
-                await delay(600); 
+                await delay(400); 
             } else {
                 canMove = false; // No valid moves found
             }
         }
 
         // End Turn
-        // Fetch latest again to be safe
         const finalState = room.roomState;
         let players = [...finalState.players];
         let turnIndex = finalState.turnIndex;
@@ -474,14 +471,23 @@ function Game() {
              attempts++;
         }
         
-        const nextId = players[nextIndex].id;
-        const count = Object.values(finalState.board).filter(c => c.owner === nextId).length;
-        const income = 2 + Math.floor(count / 3);
-        players[nextIndex].energy += income;
+        // Handle Turn Counter & Income
+        const currentTotalTurns = finalState.totalTurns || 0;
+        const newTotalTurns = currentTotalTurns + 1;
+        
+        // Only give income if everyone has played at least once (Round 2+)
+        // Or if it's an old game state (undefined check)
+        if (finalState.totalTurns === undefined || newTotalTurns >= players.length) {
+            const nextId = players[nextIndex].id;
+            const count = Object.values(finalState.board).filter(c => c.owner === nextId).length;
+            const income = 2 + Math.floor(count / 3);
+            players[nextIndex].energy += income;
+        }
 
         await room.updateRoomState({
             players,
             turnIndex: nextIndex,
+            totalTurns: newTotalTurns,
             turnStartTime: Date.now()
         });
 
@@ -626,15 +632,22 @@ function Game() {
              attempts++;
         }
         
-        // Income for next player
-        const nextPlayerId = newPlayers[nextIndex].id;
-        const territoryCount = Object.values(roomState.board).filter(c => c.owner === nextPlayerId).length;
-        const income = 2 + Math.floor(territoryCount / 3);
-        newPlayers[nextIndex].energy += income;
+        // Handle Global Turn Counter
+        const currentTotalTurns = roomState.totalTurns || 0;
+        const newTotalTurns = currentTotalTurns + 1;
+
+        // Income for next player (Only after everyone has played once)
+        if (roomState.totalTurns === undefined || newTotalTurns >= newPlayers.length) {
+            const nextPlayerId = newPlayers[nextIndex].id;
+            const territoryCount = Object.values(roomState.board).filter(c => c.owner === nextPlayerId).length;
+            const income = 2 + Math.floor(territoryCount / 3);
+            newPlayers[nextIndex].energy += income;
+        }
 
         room.updateRoomState({
             turnIndex: nextIndex,
             players: newPlayers,
+            totalTurns: newTotalTurns,
             turnStartTime: Date.now()
         });
     };
