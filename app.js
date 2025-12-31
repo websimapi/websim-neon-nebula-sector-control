@@ -10,6 +10,21 @@ const COSTS = {
     OVERLOAD: 3
 };
 
+// --- TOAST SYSTEM ---
+function showToast(message) {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+    const el = document.createElement('div');
+    el.className = 'toast';
+    el.innerText = message;
+    container.appendChild(el);
+    setTimeout(() => {
+        el.style.opacity = '0';
+        el.style.transition = 'opacity 0.5s';
+        setTimeout(() => el.remove(), 500);
+    }, 3000);
+}
+
 // --- AUDIO ---
 const sfx = {
     deploy: new Audio('sfx_deploy.mp3'),
@@ -125,6 +140,7 @@ function Game() {
                         players: [],
                         board: {},
                         turnIndex: 0,
+                        gameLog: [],
                         turnStartTime: Date.now()
                     });
                 }
@@ -208,138 +224,211 @@ function Game() {
             board,
             players,
             turnIndex: 0,
+            gameLog: ['Game Started!'],
             turnStartTime: Date.now()
         });
         
         playSound('deploy');
     };
 
-    // AI Logic Loop
+    // AI Logic Loop (Sequential Moves)
+    const aiRef = React.useRef(false);
+
     React.useEffect(() => {
         if (status !== 'playing' || !roomState.players) return;
         
         const currentPlayer = roomState.players[roomState.turnIndex];
-        // Only proceed if it's an AI turn
         if (!currentPlayer?.isAI) return;
 
-        // Determine Host (the connected player with lowest ID string sort) to run AI
+        // Host determines AI
         const connectedIds = Object.keys(peers).sort();
         const amIHost = connectedIds.length > 0 && connectedIds[0] === myId;
         
-        if (amIHost) {
-            const aiThinkTime = 800;
-            const timer = setTimeout(() => {
-                executeAITurn();
-            }, aiThinkTime);
-            return () => clearTimeout(timer);
+        if (amIHost && !aiRef.current) {
+            aiRef.current = true;
+            executeAITurnSequence(currentPlayer);
         }
     }, [roomState.turnIndex, roomState.phase, status, peers]);
 
-    const executeAITurn = () => {
-        // Deep copy state
-        let board = JSON.parse(JSON.stringify(roomState.board));
-        let players = JSON.parse(JSON.stringify(roomState.players));
-        let turnIndex = roomState.turnIndex;
-        let aiPlayer = players[turnIndex];
-        
-        // AI Strategy
+    const delay = ms => new Promise(res => setTimeout(res, ms));
+
+    const executeAITurnSequence = async (originalAiPlayer) => {
+        // Small delay before starting turn
+        await delay(1000);
+
         let moves = 0;
-        let madeMove = true;
-        
-        while (madeMove && aiPlayer.energy > 0 && moves < 5) {
-            madeMove = false;
-            moves++;
+        let canMove = true;
+        const MAX_MOVES = 5;
+
+        // We fetch fresh state at start of each action
+        while (canMove && moves < MAX_MOVES) {
+            const freshState = room.roomState; // Get latest
+            if (freshState.phase !== 'playing') break;
+            
+            // Re-find player in fresh state
+            let players = [...freshState.players];
+            let board = { ...freshState.board };
+            let turnIndex = freshState.turnIndex;
+            let aiPlayer = players[turnIndex];
+
+            // Verify it's still this AI's turn
+            if (aiPlayer.id !== originalAiPlayer.id) break;
+            if (aiPlayer.energy <= 0) break;
+
+            // --- AI DECISION LOGIC ---
+            let bestMove = null;
+            let bestScore = -Infinity;
 
             const myTiles = Object.values(board).filter(t => t.owner === aiPlayer.id);
-            
-            // 1. OVERLOAD (Attack) - Priority if stronger
+            const myTileKeys = myTiles.map(getKey);
+            const hasTiles = myTiles.length > 0;
+
+            // 1. Evaluate DEPLOY moves
+            if (aiPlayer.energy >= COSTS.DEPLOY) {
+                // Find all empty spots adjacent to me (or anywhere if I have no tiles)
+                let candidates = [];
+                if (!hasTiles) {
+                    candidates = Object.values(board).filter(t => t.owner === null);
+                } else {
+                    const potentialKeys = new Set();
+                    myTiles.forEach(t => {
+                        getNeighbors(t).forEach(n => potentialKeys.add(getKey(n)));
+                    });
+                    candidates = Array.from(potentialKeys)
+                        .map(k => board[k])
+                        .filter(t => t && t.owner === null);
+                }
+
+                candidates.forEach(target => {
+                    // Heuristic: Expand towards center or towards enemies?
+                    // Simple: Score based on number of empty neighbors (more expansion)
+                    const neighbors = getNeighbors(target);
+                    const emptyNeighbors = neighbors.filter(n => {
+                        const cell = board[getKey(n)];
+                        return cell && cell.owner === null;
+                    }).length;
+                    
+                    const score = 10 + emptyNeighbors; // Base priority for expansion
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestMove = { type: 'DEPLOY', target: target };
+                    }
+                });
+            }
+
+            // 2. Evaluate OVERLOAD moves (Attack)
             if (aiPlayer.energy >= COSTS.OVERLOAD) {
                 const targets = [];
                 myTiles.forEach(tile => {
                     getNeighbors(tile).forEach(n => {
                         const nKey = getKey(n);
                         const target = board[nKey];
-                        // If enemy tile exists
                         if (target && target.owner && target.owner !== aiPlayer.id) {
-                            // Calculate my max support strength against this target
-                            const targetNeighbors = getNeighbors(target);
-                            const maxSupport = targetNeighbors.reduce((max, tn) => {
-                                const tCell = board[getKey(tn)];
-                                if (tCell && tCell.owner === aiPlayer.id) return Math.max(max, tCell.strength);
-                                return max;
-                            }, 0);
-
-                            if (maxSupport > target.strength) {
-                                targets.push(nKey);
-                            }
+                            targets.push({ tile: target, from: tile });
                         }
                     });
                 });
 
-                if (targets.length > 0) {
-                    const targetKey = targets[Math.floor(Math.random() * targets.length)];
-                    const target = board[targetKey];
-                    board[targetKey] = { ...target, owner: aiPlayer.id, strength: Math.max(1, target.strength - 1) };
-                    aiPlayer.energy -= COSTS.OVERLOAD;
-                    madeMove = true;
-                    continue;
-                }
+                targets.forEach(({ tile, from }) => {
+                    const targetNeighbors = getNeighbors(tile);
+                    // My max strength adjacent to target
+                    const mySupport = targetNeighbors.reduce((max, n) => {
+                        const cell = board[getKey(n)];
+                        return (cell && cell.owner === aiPlayer.id) ? Math.max(max, cell.strength) : max;
+                    }, 0);
+
+                    if (mySupport > tile.strength) {
+                        // Kill probability 100%
+                        // High score if it breaks a player or is a cheap kill
+                        let score = 30 + (tile.strength * 2); 
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestMove = { type: 'OVERLOAD', target: tile };
+                        }
+                    }
+                });
             }
 
-            // 2. DEPLOY (Expand) - High priority early game
-            if (aiPlayer.energy >= COSTS.DEPLOY) {
-                const validSpots = [];
+            // 3. Evaluate FORTIFY moves (Defend)
+            if (aiPlayer.energy >= COSTS.FORTIFY) {
                 myTiles.forEach(tile => {
-                    getNeighbors(tile).forEach(n => {
-                        const k = getKey(n);
-                        if (board[k] && board[k].owner === null) {
-                            validSpots.push(k);
-                        }
+                    if (tile.strength >= 3) return; // Max str
+
+                    // Check if threatened
+                    const neighbors = getNeighbors(tile);
+                    const enemies = neighbors.filter(n => {
+                        const c = board[getKey(n)];
+                        return c && c.owner && c.owner !== aiPlayer.id;
                     });
+                    
+                    let score = 0;
+                    if (enemies.length > 0) {
+                        score = 20 + enemies.length * 5; // Defend frontlines
+                    } else {
+                        score = 5; // Low priority to bolster safe tiles
+                    }
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestMove = { type: 'FORTIFY', target: tile };
+                    }
+                });
+            }
+
+            // Execute Best Move
+            if (bestMove) {
+                const k = getKey(bestMove.target);
+                
+                if (bestMove.type === 'DEPLOY') {
+                    board[k] = { ...board[k], owner: aiPlayer.id, strength: 1 };
+                    aiPlayer.energy -= COSTS.DEPLOY;
+                    playSound('deploy');
+                } else if (bestMove.type === 'OVERLOAD') {
+                    board[k] = { ...board[k], owner: aiPlayer.id, strength: Math.max(1, board[k].strength - 1) };
+                    aiPlayer.energy -= COSTS.OVERLOAD;
+                    playSound('overload');
+                } else if (bestMove.type === 'FORTIFY') {
+                    board[k].strength += 1;
+                    aiPlayer.energy -= COSTS.FORTIFY;
+                    playSound('deploy');
+                }
+
+                // Update Scores
+                players[turnIndex] = aiPlayer;
+                players.forEach(p => {
+                    p.score = Object.values(board).filter(c => c.owner === p.id).length;
+                });
+
+                // Update Room State
+                await room.updateRoomState({
+                    board,
+                    players
                 });
                 
-                if (validSpots.length > 0) {
-                    const spot = validSpots[Math.floor(Math.random() * validSpots.length)];
-                    board[spot] = { ...board[spot], owner: aiPlayer.id, strength: 1 };
-                    aiPlayer.energy -= COSTS.DEPLOY;
-                    madeMove = true;
-                    continue;
+                // Check Win
+                const alive = players.filter(p => p.score > 0);
+                if (alive.length === 1 && players.length > 1) {
+                    room.updateRoomState({
+                        phase: 'gameover',
+                        winner: alive[0].id
+                    });
+                    aiRef.current = false;
+                    return; 
                 }
-            }
 
-            // 3. FORTIFY (Defend) - if weak and has neighbors
-            if (aiPlayer.energy >= COSTS.FORTIFY) {
-                const weakTiles = myTiles.filter(t => t.strength < 3);
-                if (weakTiles.length > 0) {
-                     const t = weakTiles[Math.floor(Math.random() * weakTiles.length)];
-                     board[getKey(t)].strength += 1;
-                     aiPlayer.energy -= COSTS.FORTIFY;
-                     madeMove = true;
-                     continue;
-                }
+                moves++;
+                await delay(800); // Visual delay between moves
+            } else {
+                canMove = false; // No valid moves found
             }
         }
 
-        // Update Score
-        players[turnIndex] = aiPlayer;
-        players.forEach(p => {
-            p.score = Object.values(board).filter(c => c.owner === p.id).length;
-        });
-
-        // Check Victory
-        const alive = players.filter(p => p.score > 0);
-        if (alive.length === 1 && players.length > 1) {
-            room.updateRoomState({
-                board,
-                players,
-                phase: 'gameover',
-                winner: alive[0].id
-            });
-            playSound('victory'); // Someone won
-            return;
-        }
-
-        // Pass Turn
+        // End Turn
+        // Fetch latest again to be safe
+        const finalState = room.roomState;
+        let players = [...finalState.players];
+        let turnIndex = finalState.turnIndex;
+        
         let nextIndex = (turnIndex + 1) % players.length;
         let attempts = 0;
         while (players[nextIndex].score === 0 && attempts < players.length) {
@@ -347,86 +436,124 @@ function Game() {
              attempts++;
         }
         
-        // Income for next
         const nextId = players[nextIndex].id;
-        const count = Object.values(board).filter(c => c.owner === nextId).length;
+        const count = Object.values(finalState.board).filter(c => c.owner === nextId).length;
         const income = 2 + Math.floor(count / 3);
         players[nextIndex].energy += income;
 
-        room.updateRoomState({
-            board,
+        await room.updateRoomState({
             players,
             turnIndex: nextIndex,
             turnStartTime: Date.now()
         });
+
+        aiRef.current = false;
     };
 
     const handleHexClick = (hex) => {
         if (status !== 'playing') return;
         
         const myPlayerIndex = roomState.players.findIndex(p => p.id === myId);
-        if (myPlayerIndex === -1) return; 
-        if (roomState.turnIndex !== myPlayerIndex) return; 
+        if (myPlayerIndex === -1) {
+            showToast("You are spectating");
+            return;
+        }
+        if (roomState.turnIndex !== myPlayerIndex) {
+            showToast("Not your turn!");
+            return;
+        }
+        if (!action) {
+            showToast("Select an action first (Deploy, Fortify, Overload)");
+            return;
+        }
 
         const key = getKey(hex);
-        // Ensure we fetch the latest cell data
         const cell = roomState.board[key];
         if (!cell) return;
 
-        // Use deep clones to prevent reference issues
         let newBoard = JSON.parse(JSON.stringify(roomState.board));
         let newPlayers = JSON.parse(JSON.stringify(roomState.players));
         let currentPlayer = newPlayers[myPlayerIndex];
         let actionSuccess = false;
 
         if (action === 'deploy') {
-            const hasEnergy = currentPlayer.energy >= COSTS.DEPLOY;
-            const isEmpty = cell.owner === null;
-            
-            if (hasEnergy && isEmpty) {
-                const neighbors = getNeighbors(hex);
-                // Check if any neighbor is owned by me
-                const hasNeighbor = neighbors.some(n => {
-                    const nKey = getKey(n);
-                    const nCell = roomState.board[nKey];
-                    return nCell && nCell.owner === myId;
-                });
-                // Check if I own ANY tile on the board (if not, I can deploy anywhere)
-                const hasAnyTile = Object.values(roomState.board).some(t => t.owner === myId);
-
-                if (hasNeighbor || !hasAnyTile) {
-                    newBoard[key].owner = myId;
-                    newBoard[key].strength = 1;
-                    currentPlayer.energy -= COSTS.DEPLOY;
-                    actionSuccess = true;
-                    playSound('deploy');
-                }
+            if (currentPlayer.energy < COSTS.DEPLOY) {
+                showToast(`Need ${COSTS.DEPLOY} energy to Deploy`);
+                return;
             }
+            if (cell.owner !== null) {
+                showToast("Target must be empty!");
+                return;
+            }
+
+            const neighbors = getNeighbors(hex);
+            const hasNeighbor = neighbors.some(n => {
+                const nCell = roomState.board[getKey(n)];
+                return nCell && nCell.owner === myId;
+            });
+            const hasAnyTile = Object.values(roomState.board).some(t => t.owner === myId);
+
+            if (!hasNeighbor && hasAnyTile) {
+                showToast("Must deploy adjacent to your territory");
+                return;
+            }
+
+            newBoard[key].owner = myId;
+            newBoard[key].strength = 1;
+            currentPlayer.energy -= COSTS.DEPLOY;
+            actionSuccess = true;
+            playSound('deploy');
+
         } else if (action === 'fortify') {
-            if (currentPlayer.energy >= COSTS.FORTIFY && cell.owner === myId) {
-                newBoard[key].strength += 1;
-                currentPlayer.energy -= COSTS.FORTIFY;
-                actionSuccess = true;
-                playSound('deploy');
+            if (currentPlayer.energy < COSTS.FORTIFY) {
+                showToast(`Need ${COSTS.FORTIFY} energy to Fortify`);
+                return;
             }
-        } else if (action === 'overload') {
-            if (currentPlayer.energy >= COSTS.OVERLOAD && cell.owner !== null && cell.owner !== myId) {
-                const neighbors = getNeighbors(hex);
-                const myStrongestAdj = neighbors.reduce((maxStr, n) => {
-                    const nKey = getKey(n);
-                    const nCell = roomState.board[nKey];
-                    if (nCell && nCell.owner === myId) return Math.max(maxStr, nCell.strength);
-                    return maxStr;
-                }, 0);
+            if (cell.owner !== myId) {
+                showToast("Can only fortify your own tiles");
+                return;
+            }
+            if (cell.strength >= 10) { // Arbitrary cap
+                 showToast("Maximum strength reached");
+                 return;
+            }
 
-                if (myStrongestAdj > cell.strength) {
-                    newBoard[key].owner = myId;
-                    newBoard[key].strength = Math.max(1, cell.strength - 1);
-                    currentPlayer.energy -= COSTS.OVERLOAD;
-                    actionSuccess = true;
-                    playSound('overload');
-                }
+            newBoard[key].strength += 1;
+            currentPlayer.energy -= COSTS.FORTIFY;
+            actionSuccess = true;
+            playSound('deploy');
+
+        } else if (action === 'overload') {
+            if (currentPlayer.energy < COSTS.OVERLOAD) {
+                showToast(`Need ${COSTS.OVERLOAD} energy to Overload`);
+                return;
             }
+            if (cell.owner === null || cell.owner === myId) {
+                showToast("Must target an enemy tile");
+                return;
+            }
+
+            const neighbors = getNeighbors(hex);
+            const myStrongestAdj = neighbors.reduce((maxStr, n) => {
+                const nCell = roomState.board[getKey(n)];
+                if (nCell && nCell.owner === myId) return Math.max(maxStr, nCell.strength);
+                return maxStr;
+            }, 0);
+
+            if (myStrongestAdj <= 0) {
+                 showToast("Must be adjacent to your tile");
+                 return;
+            }
+            if (myStrongestAdj <= cell.strength) {
+                showToast(`Insufficient power! Need > ${cell.strength} strength nearby.`);
+                return;
+            }
+
+            newBoard[key].owner = myId;
+            newBoard[key].strength = Math.max(1, cell.strength - 1);
+            currentPlayer.energy -= COSTS.OVERLOAD;
+            actionSuccess = true;
+            playSound('overload');
         }
 
         if (actionSuccess) {
@@ -505,6 +632,9 @@ function Game() {
             let strokeWidth = null;
             let cursor = 'default';
 
+            let isValidTarget = false;
+            let classNames = `hex ${colorClass}`;
+
             if (isMyTurn && action) {
                 const neighbors = getNeighbors(hex);
                 const hasFriendlyAdj = neighbors.some(n => {
@@ -513,21 +643,29 @@ function Game() {
                 });
                 const hasAnyTile = Object.values(roomState.board).some(t => t.owner === myId);
                 
-                let isValidTarget = false;
+                // --- Validation Logic ---
+                // Must match handleHexClick logic exactly for visual consistency
                 if (action === 'deploy') {
                      isValidTarget = hex.owner === null && (hasFriendlyAdj || !hasAnyTile);
                 } else if (action === 'fortify') {
                      isValidTarget = hex.owner === myId;
                 } else if (action === 'overload') {
-                     isValidTarget = hex.owner && hex.owner !== myId && hasFriendlyAdj;
+                    // Pre-calculate strength to see if target is valid
+                     if (hex.owner && hex.owner !== myId) {
+                         const myStrongestAdj = neighbors.reduce((maxStr, n) => {
+                            const nCell = roomState.board[getKey(n)];
+                            if (nCell && nCell.owner === myId) return Math.max(maxStr, nCell.strength);
+                            return maxStr;
+                         }, 0);
+                         isValidTarget = myStrongestAdj > hex.strength;
+                     }
                 }
 
                 if (isValidTarget) {
-                    stroke = '#fff';
-                    strokeWidth = 3;
+                    classNames += " valid-target";
                     cursor = 'pointer';
                 } else {
-                    opacity = 0.2;
+                    opacity = 0.3; // Dim invalid targets
                 }
             } else if (isMyTurn && !action && hex.owner === myId) {
                  // Hint that you can select this tile (maybe for info in future)
@@ -542,7 +680,7 @@ function Game() {
                    style={{ cursor }}>
                     <polygon 
                         points="0,-30 26,-15 26,15 0,30 -26,15 -26,-15" 
-                        className={`hex ${colorClass}`}
+                        className={classNames}
                         style={{ opacity, stroke: stroke || undefined, strokeWidth: strokeWidth || undefined }}
                     />
                     {hex.strength > 0 && (
