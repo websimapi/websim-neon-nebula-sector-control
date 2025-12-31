@@ -383,7 +383,7 @@ function Game() {
                    onClick={() => handleHexClick(hex)}
                    className="hex-group">
                     <polygon 
-                        points="-30,-15 -15,-30 15,-30 30,-15 30,15 15,30 -15,30 -30,15" // Approx hex
+                        points="0,-30 26,-15 26,15 0,30 -26,15 -26,-15" 
                         className={`hex ${colorClass}`}
                         style={{ opacity, stroke: stroke || undefined }}
                     />
