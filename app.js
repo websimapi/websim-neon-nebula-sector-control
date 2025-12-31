@@ -150,24 +150,40 @@ function Game() {
     // --- GAME ACTIONS ---
 
     const startGame = () => {
-        const playerIds = Object.keys(peers);
-        if (playerIds.length < 1) return; 
+        const humanIds = Object.keys(peers);
+        if (humanIds.length < 1) return; 
 
-        // 1. Setup Grid
-        const grid = getHexGrid(BOARD_RADIUS);
-        const board = {};
-        grid.forEach(hex => {
-            board[getKey(hex)] = { ...hex, owner: null, strength: 0 };
-        });
-
-        // 2. Setup Players
-        const players = playerIds.map((id, index) => ({
+        // 1. Setup Players (Add AI if solo)
+        let players = humanIds.map((id, index) => ({
             id: id,
+            isAI: false,
             colorIndex: index + 1,
             energy: STARTING_ENERGY,
             score: 0,
             username: peers[id].username
         }));
+
+        if (players.length === 1) {
+            // Add 3 AI bots for a 4-player game
+            const aiNames = ['Alpha', 'Beta', 'Gamma', 'Delta'];
+            for (let i = 0; i < 3; i++) {
+                players.push({
+                    id: `ai-${i}`,
+                    isAI: true,
+                    colorIndex: players.length + 1,
+                    energy: STARTING_ENERGY,
+                    score: 0,
+                    username: `Bot ${aiNames[i]}`
+                });
+            }
+        }
+
+        // 2. Setup Grid
+        const grid = getHexGrid(BOARD_RADIUS);
+        const board = {};
+        grid.forEach(hex => {
+            board[getKey(hex)] = { ...hex, owner: null, strength: 0 };
+        });
 
         // 3. Assign Starts
         const starts = [];
@@ -196,6 +212,153 @@ function Game() {
         });
         
         playSound('deploy');
+    };
+
+    // AI Logic Loop
+    React.useEffect(() => {
+        if (status !== 'playing' || !roomState.players) return;
+        
+        const currentPlayer = roomState.players[roomState.turnIndex];
+        // Only proceed if it's an AI turn
+        if (!currentPlayer?.isAI) return;
+
+        // Determine Host (the connected player with lowest ID string sort) to run AI
+        const connectedIds = Object.keys(peers).sort();
+        const amIHost = connectedIds.length > 0 && connectedIds[0] === myId;
+        
+        if (amIHost) {
+            const aiThinkTime = 800;
+            const timer = setTimeout(() => {
+                executeAITurn();
+            }, aiThinkTime);
+            return () => clearTimeout(timer);
+        }
+    }, [roomState.turnIndex, roomState.phase, status, peers]);
+
+    const executeAITurn = () => {
+        // Deep copy state
+        let board = JSON.parse(JSON.stringify(roomState.board));
+        let players = JSON.parse(JSON.stringify(roomState.players));
+        let turnIndex = roomState.turnIndex;
+        let aiPlayer = players[turnIndex];
+        
+        // AI Strategy
+        let moves = 0;
+        let madeMove = true;
+        
+        while (madeMove && aiPlayer.energy > 0 && moves < 5) {
+            madeMove = false;
+            moves++;
+
+            const myTiles = Object.values(board).filter(t => t.owner === aiPlayer.id);
+            
+            // 1. OVERLOAD (Attack) - Priority if stronger
+            if (aiPlayer.energy >= COSTS.OVERLOAD) {
+                const targets = [];
+                myTiles.forEach(tile => {
+                    getNeighbors(tile).forEach(n => {
+                        const nKey = getKey(n);
+                        const target = board[nKey];
+                        // If enemy tile exists
+                        if (target && target.owner && target.owner !== aiPlayer.id) {
+                            // Calculate my max support strength against this target
+                            const targetNeighbors = getNeighbors(target);
+                            const maxSupport = targetNeighbors.reduce((max, tn) => {
+                                const tCell = board[getKey(tn)];
+                                if (tCell && tCell.owner === aiPlayer.id) return Math.max(max, tCell.strength);
+                                return max;
+                            }, 0);
+
+                            if (maxSupport > target.strength) {
+                                targets.push(nKey);
+                            }
+                        }
+                    });
+                });
+
+                if (targets.length > 0) {
+                    const targetKey = targets[Math.floor(Math.random() * targets.length)];
+                    const target = board[targetKey];
+                    board[targetKey] = { ...target, owner: aiPlayer.id, strength: Math.max(1, target.strength - 1) };
+                    aiPlayer.energy -= COSTS.OVERLOAD;
+                    madeMove = true;
+                    continue;
+                }
+            }
+
+            // 2. DEPLOY (Expand) - High priority early game
+            if (aiPlayer.energy >= COSTS.DEPLOY) {
+                const validSpots = [];
+                myTiles.forEach(tile => {
+                    getNeighbors(tile).forEach(n => {
+                        const k = getKey(n);
+                        if (board[k] && board[k].owner === null) {
+                            validSpots.push(k);
+                        }
+                    });
+                });
+                
+                if (validSpots.length > 0) {
+                    const spot = validSpots[Math.floor(Math.random() * validSpots.length)];
+                    board[spot] = { ...board[spot], owner: aiPlayer.id, strength: 1 };
+                    aiPlayer.energy -= COSTS.DEPLOY;
+                    madeMove = true;
+                    continue;
+                }
+            }
+
+            // 3. FORTIFY (Defend) - if weak and has neighbors
+            if (aiPlayer.energy >= COSTS.FORTIFY) {
+                const weakTiles = myTiles.filter(t => t.strength < 3);
+                if (weakTiles.length > 0) {
+                     const t = weakTiles[Math.floor(Math.random() * weakTiles.length)];
+                     board[getKey(t)].strength += 1;
+                     aiPlayer.energy -= COSTS.FORTIFY;
+                     madeMove = true;
+                     continue;
+                }
+            }
+        }
+
+        // Update Score
+        players[turnIndex] = aiPlayer;
+        players.forEach(p => {
+            p.score = Object.values(board).filter(c => c.owner === p.id).length;
+        });
+
+        // Check Victory
+        const alive = players.filter(p => p.score > 0);
+        if (alive.length === 1 && players.length > 1) {
+            room.updateRoomState({
+                board,
+                players,
+                phase: 'gameover',
+                winner: alive[0].id
+            });
+            playSound('victory'); // Someone won
+            return;
+        }
+
+        // Pass Turn
+        let nextIndex = (turnIndex + 1) % players.length;
+        let attempts = 0;
+        while (players[nextIndex].score === 0 && attempts < players.length) {
+             nextIndex = (nextIndex + 1) % players.length;
+             attempts++;
+        }
+        
+        // Income for next
+        const nextId = players[nextIndex].id;
+        const count = Object.values(board).filter(c => c.owner === nextId).length;
+        const income = 2 + Math.floor(count / 3);
+        players[nextIndex].energy += income;
+
+        room.updateRoomState({
+            board,
+            players,
+            turnIndex: nextIndex,
+            turnStartTime: Date.now()
+        });
     };
 
     const handleHexClick = (hex) => {
@@ -389,7 +552,10 @@ function Game() {
                             ))}
                         </ul>
                         {isHost ? (
-                            <button className="btn" disabled={Object.keys(peers).length < 1} onClick={startGame}>Start Conquest</button>
+                            <div style={{display:'flex', flexDirection:'column', gap:'10px'}}>
+                                <button className="btn" disabled={Object.keys(peers).length < 1} onClick={startGame}>Start Conquest</button>
+                                {Object.keys(peers).length === 1 && <span style={{fontSize:'0.8rem', color:'#888'}}>AI Bots will be added</span>}
+                            </div>
                         ) : <p>Waiting for host...</p>}
                     </div>
                     <div className="modal">
