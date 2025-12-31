@@ -8,8 +8,12 @@ const WIN_PCT = 0.8;
 const COSTS = {
     DEPLOY: 2,
     FORTIFY: 1,
-    OVERLOAD: 3
+    OVERLOAD: 3,
+    REINFORCE: 4,
+    STRIKE: 5
 };
+
+const ITEMS = ['energy', 'crystal', 'shockwave'];
 
 // --- TOAST SYSTEM ---
 function showToast(message) {
@@ -30,7 +34,9 @@ function showToast(message) {
 const sfx = {
     deploy: new Audio('sfx_deploy.mp3'),
     overload: new Audio('sfx_overload.mp3'),
-    victory: new Audio('sfx_victory.mp3')
+    victory: new Audio('sfx_victory.mp3'),
+    strike: new Audio('sfx_strike.mp3'),
+    powerup: new Audio('sfx_powerup.mp3')
 };
 const playSound = (name) => {
     sfx[name].currentTime = 0;
@@ -215,8 +221,13 @@ function Game() {
             // 15% Mountains (Defensive Bonus, Higher Cost)
             if (Math.random() < 0.15) type = 'MOUNTAIN';
 
-            // 5% Powerups on normal tiles
-            if (type === 'NORMAL' && Math.random() < 0.05) item = 'energy';
+            // 8% Powerups on normal tiles
+            if (type === 'NORMAL' && Math.random() < 0.08) {
+                const rand = Math.random();
+                if (rand < 0.5) item = 'energy';
+                else if (rand < 0.8) item = 'crystal';
+                else item = 'shockwave';
+            }
 
             board[getKey(hex)] = { ...hex, owner: null, strength: 0, type, item };
         });
@@ -277,26 +288,23 @@ function Game() {
     const executeAITurnSequence = async (originalAiPlayer) => {
         // AI Personality Weights
         const weights = {
-            BALANCED: { deploy: 1.0, overload: 1.0, fortify: 1.0 },
-            AGGRESSIVE: { deploy: 0.8, overload: 1.4, fortify: 0.6 },
-            DEFENSIVE: { deploy: 0.8, overload: 0.6, fortify: 1.4 },
-            EXPANSIVE: { deploy: 1.4, overload: 0.8, fortify: 0.8 }
+            BALANCED: { deploy: 1.0, overload: 1.0, fortify: 1.0, reinforce: 1.0, strike: 1.0 },
+            AGGRESSIVE: { deploy: 0.8, overload: 1.4, fortify: 0.6, reinforce: 0.8, strike: 1.5 },
+            DEFENSIVE: { deploy: 0.8, overload: 0.6, fortify: 1.4, reinforce: 1.5, strike: 0.5 },
+            EXPANSIVE: { deploy: 1.4, overload: 0.8, fortify: 0.8, reinforce: 0.8, strike: 0.8 }
         };
 
         const personality = originalAiPlayer.personality || 'BALANCED';
         const w = weights[personality];
 
-        // Small delay before starting turn
-        await delay(1000);
+        await delay(800);
 
         let moves = 0;
         let canMove = true;
-        // Dynamic max moves to ensure AI spends energy if possible
         const MAX_MOVES = Math.max(8, originalAiPlayer.energy);
 
-        // We fetch fresh state at start of each action
         while (canMove && moves < MAX_MOVES) {
-            const freshState = room.roomState; // Get latest
+            const freshState = room.roomState;
             if (freshState.phase !== 'playing') break;
             
             let players = [...freshState.players];
@@ -304,22 +312,20 @@ function Game() {
             let turnIndex = freshState.turnIndex;
             let aiPlayer = players[turnIndex];
 
-            // Verify it's still this AI's turn
             if (aiPlayer.id !== originalAiPlayer.id) break;
             if (aiPlayer.energy <= 0) break;
 
-            // --- AI DECISION LOGIC ---
             let bestMove = null;
             let bestScore = -Infinity;
 
             const myTiles = Object.values(board).filter(t => t.owner === aiPlayer.id);
             const hasTiles = myTiles.length > 0;
+            const enemyTiles = Object.values(board).filter(t => t.owner && t.owner !== aiPlayer.id);
 
-            // 1. Evaluate DEPLOY moves
+            // 1. DEPLOY
             if (aiPlayer.energy >= COSTS.DEPLOY) {
                 let candidates = [];
                 if (!hasTiles) {
-                    // Respawn logic
                     candidates = Object.values(board).filter(t => !t.owner);
                 } else {
                     const potentialKeys = new Set();
@@ -328,34 +334,25 @@ function Game() {
                     });
                     candidates = Array.from(potentialKeys)
                         .map(k => board[k])
-                        .filter(t => t && (!t.owner || !players.some(p => p.id === t.owner))); // Treat zombie as empty
+                        .filter(t => t && (!t.owner || !players.some(p => p.id === t.owner))); 
                 }
 
                 candidates.forEach(target => {
                     const neighbors = getNeighbors(target);
-                    // Heuristic: Prefer spots with more empty neighbors (expansion potential)
                     const emptyNeighbors = neighbors.filter(n => {
                         const cell = board[getKey(n)];
                         return cell && !cell.owner;
                     }).length;
-                    
-                    // Prefer spots connecting to my own territory strongly?
                     const myNeighbors = neighbors.filter(n => {
                         const cell = board[getKey(n)];
                         return cell && cell.owner === aiPlayer.id;
                     }).length;
 
-                    // Base 10 + bonus
                     let rawScore = 10 + (emptyNeighbors * 2) + myNeighbors;
-                    
-                    // Prioritize Items
-                    if (target.item === 'energy') rawScore += 25;
-                    
-                    // Mountains cost more but are defensive
+                    if (target.item) rawScore += 30; // Prioritize items
                     if (target.type === 'MOUNTAIN') rawScore -= 5;
 
                     let score = rawScore * w.deploy;
-
                     if (score > bestScore) {
                         bestScore = score;
                         bestMove = { type: 'DEPLOY', target: target };
@@ -363,35 +360,24 @@ function Game() {
                 });
             }
 
-            // 2. Evaluate OVERLOAD moves (Attack)
+            // 2. OVERLOAD (Adjacent Attack)
             if (aiPlayer.energy >= COSTS.OVERLOAD) {
-                const targets = [];
-                myTiles.forEach(tile => {
-                    getNeighbors(tile).forEach(n => {
-                        const nKey = getKey(n);
-                        const target = board[nKey];
-                        // Target must be enemy
-                        if (target && target.owner && target.owner !== aiPlayer.id) {
-                            targets.push(target);
-                        }
-                    });
-                });
-
-                // Unique targets
-                const uniqueTargets = [...new Set(targets)];
+                const uniqueTargets = [...new Set(myTiles.flatMap(t => 
+                    getNeighbors(t).map(n => board[getKey(n)]).filter(target => 
+                        target && target.owner && target.owner !== aiPlayer.id
+                    )
+                ))];
 
                 uniqueTargets.forEach(target => {
-                    const targetNeighbors = getNeighbors(target);
-                    const mySupport = targetNeighbors.reduce((max, n) => {
+                    const neighbors = getNeighbors(target);
+                    const mySupport = neighbors.reduce((max, n) => {
                         const cell = board[getKey(n)];
                         return (cell && cell.owner === aiPlayer.id) ? Math.max(max, cell.strength) : max;
                     }, 0);
 
                     if (mySupport > target.strength) {
-                        // We can kill it.
                         let rawScore = 25 + (target.strength * 4); 
                         let score = rawScore * w.overload;
-
                         if (score > bestScore) {
                             bestScore = score;
                             bestMove = { type: 'OVERLOAD', target: target };
@@ -400,29 +386,59 @@ function Game() {
                 });
             }
 
-            // 3. Evaluate FORTIFY moves (Defend)
+            // 3. REINFORCE (Big Defense)
+            if (aiPlayer.energy >= COSTS.REINFORCE) {
+                myTiles.forEach(tile => {
+                     if (tile.strength >= 12) return;
+                     const neighbors = getNeighbors(tile);
+                     const enemies = neighbors.filter(n => {
+                        const c = board[getKey(n)];
+                        return c && c.owner && c.owner !== aiPlayer.id;
+                     }).length;
+
+                     let rawScore = (enemies * 8) + (8 - tile.strength);
+                     if (enemies === 0 && tile.strength < 5) rawScore = 5; 
+
+                     let score = rawScore * w.reinforce;
+                     if (score > bestScore) {
+                         bestScore = score;
+                         bestMove = { type: 'REINFORCE', target: tile };
+                     }
+                });
+            }
+
+            // 4. STRIKE (Global Attack)
+            if (aiPlayer.energy >= COSTS.STRIKE && enemyTiles.length > 0) {
+                 // Target high value weak spots
+                 enemyTiles.forEach(target => {
+                     if (target.strength <= 4) {
+                         let rawScore = 15 + (10 - target.strength);
+                         // Bonus if killing it disconnects? Too complex.
+                         // Bonus if it's the leader?
+                         const owner = players.find(p => p.id === target.owner);
+                         if (owner && owner.score > aiPlayer.score) rawScore += 10;
+
+                         let score = rawScore * w.strike;
+                         if (score > bestScore) {
+                             bestScore = score;
+                             bestMove = { type: 'STRIKE', target: target };
+                         }
+                     }
+                 });
+            }
+
+            // 5. FORTIFY (Small Defense) - fallback
             if (aiPlayer.energy >= COSTS.FORTIFY) {
                 myTiles.forEach(tile => {
-                    if (tile.strength >= 10) return; // Cap for AI
-
-                    // Check if threatened
+                    if (tile.strength >= 10) return; 
                     const neighbors = getNeighbors(tile);
-                    const enemies = neighbors.filter(n => {
+                    const enemies = neighbors.some(n => {
                         const c = board[getKey(n)];
                         return c && c.owner && c.owner !== aiPlayer.id;
                     });
                     
-                    let rawScore = 0;
-                    if (enemies.length > 0) {
-                        // High priority if threatened
-                        rawScore = 15 + (enemies.length * 5) + (5 - tile.strength);
-                    } else {
-                        // Low priority to just buff safe tiles
-                        rawScore = 2; 
-                    }
-
+                    let rawScore = enemies ? 10 : 2;
                     let score = rawScore * w.fortify;
-
                     if (score > bestScore) {
                         bestScore = score;
                         bestMove = { type: 'FORTIFY', target: tile };
@@ -430,41 +446,59 @@ function Game() {
                 });
             }
 
-            // Execute Best Move
+            // Execute
             if (bestMove) {
                 const k = getKey(bestMove.target);
-                
-                // Powerup Collection Logic
-                if (board[k].item === 'energy') {
-                    aiPlayer.energy += 5;
+                let capturedItem = null;
+
+                // Move Costs
+                let moveCost = COSTS[bestMove.type];
+                if (board[k].type === 'MOUNTAIN' && bestMove.type === 'DEPLOY') moveCost += 1;
+                if (board[k].type === 'MOUNTAIN' && bestMove.type === 'OVERLOAD') moveCost += 1;
+
+                // Perform Logic
+                let sfxName = 'deploy';
+                if (bestMove.type === 'DEPLOY') {
+                    board[k] = { ...board[k], owner: aiPlayer.id, strength: 1 };
+                    capturedItem = board[k].item;
+                } else if (bestMove.type === 'OVERLOAD') {
+                    board[k] = { ...board[k], owner: aiPlayer.id, strength: Math.max(1, board[k].strength - 1) };
+                    sfxName = 'overload';
+                } else if (bestMove.type === 'FORTIFY') {
+                    board[k].strength += 1;
+                } else if (bestMove.type === 'REINFORCE') {
+                    board[k].strength += 5;
+                    sfxName = 'powerup';
+                } else if (bestMove.type === 'STRIKE') {
+                    board[k].strength -= 4;
+                    if (board[k].strength <= 0) {
+                        board[k].strength = 0;
+                        board[k].owner = null;
+                    }
+                    sfxName = 'strike';
+                }
+
+                aiPlayer.energy -= moveCost;
+                playSound(sfxName);
+
+                // Handle Item Capture
+                if (capturedItem) {
+                    if (capturedItem === 'energy') { aiPlayer.energy += 5; }
+                    else if (capturedItem === 'crystal') { board[k].strength += 5; playSound('powerup'); }
+                    else if (capturedItem === 'shockwave') {
+                        getNeighbors(board[k]).forEach(n => {
+                            const nk = getKey(n);
+                            if (board[nk] && board[nk].owner && board[nk].owner !== aiPlayer.id) {
+                                board[nk].strength -= 3;
+                                if (board[nk].strength <= 0) { board[nk].strength = 0; board[nk].owner = null; }
+                            }
+                        });
+                        playSound('strike');
+                    }
                     board[k].item = null;
                 }
 
-                // Terrain Cost Logic
-                let moveCost = 0;
-                if (bestMove.type === 'DEPLOY') moveCost = COSTS.DEPLOY;
-                else if (bestMove.type === 'OVERLOAD') moveCost = COSTS.OVERLOAD;
-                else if (bestMove.type === 'FORTIFY') moveCost = COSTS.FORTIFY;
-
-                if (board[k].type === 'MOUNTAIN' && bestMove.type !== 'FORTIFY') {
-                    moveCost += 1;
-                }
-
-                if (bestMove.type === 'DEPLOY') {
-                    board[k] = { ...board[k], owner: aiPlayer.id, strength: 1 };
-                    aiPlayer.energy -= moveCost;
-                    playSound('deploy');
-                } else if (bestMove.type === 'OVERLOAD') {
-                    board[k] = { ...board[k], owner: aiPlayer.id, strength: Math.max(1, board[k].strength - 1) };
-                    aiPlayer.energy -= moveCost;
-                    playSound('overload');
-                } else if (bestMove.type === 'FORTIFY') {
-                    board[k].strength += 1;
-                    aiPlayer.energy -= moveCost;
-                    playSound('deploy');
-                }
-
-                // Update Scores & Check Domination
+                // Update scores
                 players[turnIndex] = aiPlayer;
                 const totalHexes = Object.keys(board).length;
                 players.forEach(p => {
@@ -569,8 +603,11 @@ function Game() {
         if (action === 'deploy') cost = COSTS.DEPLOY;
         else if (action === 'fortify') cost = COSTS.FORTIFY;
         else if (action === 'overload') cost = COSTS.OVERLOAD;
+        else if (action === 'reinforce') cost = COSTS.REINFORCE;
+        else if (action === 'strike') cost = COSTS.STRIKE;
 
-        if (cell.type === 'MOUNTAIN' && action !== 'fortify') cost += 1;
+        // Mountain penalty applies to movement/deployment, not remote attacks or reinforcement
+        if (cell.type === 'MOUNTAIN' && (action === 'deploy' || action === 'overload')) cost += 1;
 
         if (currentPlayer.energy < cost) {
             showToast(`Need ${cost} energy (Terrain Penalty: ${cell.type==='MOUNTAIN' && action!=='fortify' ? '+1' : '0'})`);
@@ -583,19 +620,16 @@ function Game() {
                 showToast("Target must be empty!");
                 return;
             }
-
             const neighbors = getNeighbors(hex);
             const hasNeighbor = neighbors.some(n => {
                 const nCell = roomState.board[getKey(n)];
                 return nCell && nCell.owner === myId;
             });
             const hasAnyTile = Object.values(roomState.board).some(t => t.owner === myId);
-
             if (!hasNeighbor && hasAnyTile) {
                 showToast("Must deploy adjacent to your territory");
                 return;
             }
-
             newBoard[key].owner = myId;
             newBoard[key].strength = 1;
             currentPlayer.energy -= cost;
@@ -603,27 +637,23 @@ function Game() {
             playSound('deploy');
 
         } else if (action === 'fortify') {
-            if (cell.owner !== myId) {
-                showToast("Can only fortify your own tiles");
-                return;
-            }
-            const cap = cell.type === 'MOUNTAIN' ? 15 : 10;
-            if (cell.strength >= cap) {
-                 showToast(`Maximum strength reached (${cap})`);
-                 return;
-            }
-
+            if (cell.owner !== myId) return showToast("Target your own tile");
+            if (cell.strength >= (cell.type === 'MOUNTAIN' ? 15 : 10)) return showToast("Max strength reached");
             newBoard[key].strength += 1;
             currentPlayer.energy -= cost;
             actionSuccess = true;
             playSound('deploy');
 
-        } else if (action === 'overload') {
-            if (cell.owner === null || cell.owner === myId) {
-                showToast("Must target an enemy tile");
-                return;
-            }
+        } else if (action === 'reinforce') {
+            if (cell.owner !== myId) return showToast("Target your own tile");
+            newBoard[key].strength += 5;
+            currentPlayer.energy -= cost;
+            actionSuccess = true;
+            playSound('powerup');
+            showToast("Reinforcements arrived!");
 
+        } else if (action === 'overload') {
+            if (cell.owner === null || cell.owner === myId) return showToast("Target an enemy");
             const neighbors = getNeighbors(hex);
             const myStrongestAdj = neighbors.reduce((maxStr, n) => {
                 const nCell = roomState.board[getKey(n)];
@@ -631,33 +661,57 @@ function Game() {
                 return maxStr;
             }, 0);
 
-            if (myStrongestAdj <= 0) {
-                 showToast("Must be adjacent to your tile");
-                 return;
-            }
-            if (myStrongestAdj <= cell.strength) {
-                showToast(`Insufficient power! Need > ${cell.strength} strength nearby.`);
-                return;
-            }
-
+            if (myStrongestAdj <= cell.strength) return showToast(`Insufficient power! Need > ${cell.strength} strength nearby.`);
+            
             newBoard[key].owner = myId;
             newBoard[key].strength = Math.max(1, cell.strength - 1);
             currentPlayer.energy -= cost;
             actionSuccess = true;
             playSound('overload');
+
+        } else if (action === 'strike') {
+            if (!cell.owner || cell.owner === myId) return showToast("Target an enemy anywhere on map");
+            newBoard[key].strength -= 4;
+            if (newBoard[key].strength <= 0) {
+                newBoard[key].strength = 0;
+                newBoard[key].owner = null;
+                showToast("Target neutralized!");
+            } else {
+                showToast("Target damaged!");
+            }
+            currentPlayer.energy -= cost;
+            actionSuccess = true;
+            playSound('strike');
         }
 
         if (actionSuccess) {
-            // Collect Item
-            if (newBoard[key].item === 'energy' && action !== 'overload') { // Cannot collect if overloading enemy? Actually if you capture it you should.
-               // If overload success (tile flips), or deploy success
-               // Actually overload flips it immediately in this logic, so yes.
-               currentPlayer.energy += 5;
-               newBoard[key].item = null;
-               showToast("Energy Cache Collected! +5⚡");
+            // Check for item pickup if we now own the tile (Deploy or Overload)
+            if (newBoard[key].owner === myId && newBoard[key].item) {
+                const item = newBoard[key].item;
+                if (item === 'energy') {
+                    currentPlayer.energy += 5;
+                    showToast("Energy Cache! +5⚡");
+                } else if (item === 'crystal') {
+                    newBoard[key].strength += 5;
+                    playSound('powerup');
+                    showToast("Power Crystal! +5 Strength");
+                } else if (item === 'shockwave') {
+                    // Damage all adjacent enemies
+                    getNeighbors(hex).forEach(n => {
+                        const nKey = getKey(n);
+                        if (newBoard[nKey] && newBoard[nKey].owner && newBoard[nKey].owner !== myId) {
+                            newBoard[nKey].strength -= 3;
+                            if (newBoard[nKey].strength <= 0) {
+                                newBoard[nKey].strength = 0;
+                                newBoard[nKey].owner = null;
+                            }
+                        }
+                    });
+                    playSound('strike');
+                    showToast("Shockwave Triggered!");
+                }
+                newBoard[key].item = null;
             }
-            // Note: If overloading and not capturing (just reducing strength), item remains?
-            // Current overload logic: newBoard[key].owner = myId immediately if successful.
             
             const totalHexes = Object.keys(newBoard).length;
 
@@ -709,9 +763,33 @@ function Game() {
             newPlayers[nextIndex].energy += income;
         }
 
+        let newBoard = roomState.board;
+        // Spawn Items Every Full Round
+        if (newTotalTurns > 0 && newTotalTurns % newPlayers.length === 0) {
+            newBoard = { ...roomState.board }; // Clone
+            const emptyTiles = Object.values(newBoard).filter(t => !t.owner && !t.item && t.type !== 'void');
+            if (emptyTiles.length > 0) {
+                // Spawn 1-2 items
+                const count = Math.random() < 0.3 ? 2 : 1;
+                for(let i=0; i<count; i++) {
+                    if (emptyTiles.length === 0) break;
+                    const idx = Math.floor(Math.random() * emptyTiles.length);
+                    const tile = emptyTiles.splice(idx, 1)[0];
+                    const rand = Math.random();
+                    let itemType = 'energy';
+                    if (rand > 0.5) itemType = 'crystal';
+                    if (rand > 0.8) itemType = 'shockwave';
+                    
+                    newBoard[getKey(tile)].item = itemType;
+                }
+                showToast("Supply drop incoming!");
+            }
+        }
+
         room.updateRoomState({
             turnIndex: nextIndex,
             players: newPlayers,
+            board: newBoard,
             totalTurns: newTotalTurns,
             turnStartTime: Date.now()
         });
@@ -782,6 +860,10 @@ function Game() {
                          }, 0);
                          isValidTarget = myStrongestAdj > hex.strength;
                      }
+                } else if (action === 'reinforce') {
+                    isValidTarget = hex.owner === myId;
+                } else if (action === 'strike') {
+                    isValidTarget = hex.owner && hex.owner !== myId;
                 }
 
                 if (isValidTarget) {
@@ -817,8 +899,12 @@ function Game() {
                         className={classNames}
                         style={{ opacity, stroke: stroke || undefined, strokeWidth: strokeWidth || undefined }}
                     />
-                    {hex.item === 'energy' && !hex.owner && (
-                         <image href="icon_energy.png" x="-10" y="-10" width="20" height="20" className="item-icon" />
+                    {hex.item && !hex.owner && (
+                        <g className="item-icon">
+                            {hex.item === 'energy' && <image href="icon_energy.png" x="-10" y="-10" width="20" height="20" />}
+                            {hex.item === 'crystal' && <image href="icon_shield.png" x="-10" y="-10" width="20" height="20" style={{filter:'hue-rotate(90deg)'}} />}
+                            {hex.item === 'shockwave' && <image href="icon_attack.png" x="-10" y="-10" width="20" height="20" style={{filter:'hue-rotate(180deg)'}} />}
+                        </g>
                     )}
                     {hex.strength > 0 && (
                         <text x="0" y="5" textAnchor="middle" className="hex-label">{hex.strength}</text>
@@ -918,7 +1004,15 @@ function Game() {
                          style={{opacity:canAfford(COSTS.OVERLOAD)?1:0.5}}>
                         <img src="icon_attack.png"/><span>Overload ({COSTS.OVERLOAD})</span>
                     </div>
-                    <button className="btn btn-secondary" onClick={endTurn} style={{marginLeft:'20px'}}>End Turn</button>
+                    <div className={`action-card ${action === 'reinforce' ? 'selected' : ''}`} onClick={() => setAction(action==='reinforce'?null:'reinforce')}
+                         style={{opacity:canAfford(COSTS.REINFORCE)?1:0.5}}>
+                        <img src="icon_buff.png"/><span>Boost ({COSTS.REINFORCE})</span>
+                    </div>
+                    <div className={`action-card ${action === 'strike' ? 'selected' : ''}`} onClick={() => setAction(action==='strike'?null:'strike')}
+                         style={{opacity:canAfford(COSTS.STRIKE)?1:0.5}}>
+                        <img src="icon_strike.png"/><span>Strike ({COSTS.STRIKE})</span>
+                    </div>
+                    <button className="btn btn-secondary" onClick={endTurn} style={{marginLeft:'20px'}}>End</button>
                 </div>
             ) : (
                 <div className="hud-bottom"><p>Waiting for {roomState.players[roomState.turnIndex]?.username}...</p></div>

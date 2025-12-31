@@ -92,12 +92,14 @@ body {
     bottom: 0;
     left: 0;
     right: 0;
-    padding: 15px;
-    background: linear-gradient(to top, rgba(0,0,0,0.9), transparent);
+    padding: 10px;
+    background: linear-gradient(to top, rgba(0,0,0,0.95), rgba(0,0,0,0.5));
     display: flex;
     justify-content: center;
-    gap: 15px;
+    gap: 8px;
     z-index: 10;
+    flex-wrap: wrap;
+    overflow-x: auto;
 }
 
 /* Typography */
@@ -267,13 +269,16 @@ svg.hex-grid {
     background: var(--panel-bg);
     border: 1px solid #333;
     border-radius: 8px;
-    padding: 10px;
+    padding: 8px;
     display: flex;
     flex-direction: column;
     align-items: center;
-    min-width: 80px;
+    min-width: 60px;
+    max-width: 90px;
     cursor: pointer;
     transition: transform 0.2s;
+    font-size: 0.8rem;
+    text-align: center;
 }
 
 .action-card.selected {
